@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,25 @@ var sniPool = []string{
 }
 
 func randomSNI() string { return sniPool[rand.Intn(len(sniPool))] }
+
+// maskIP replaces the middle segments of an IP with *.
+// "216.118.241.194" → "216.***.241.194"
+// "2001:db8::1"     → "2001:***::1"
+func maskIP(ip string) string {
+	parts := strings.Split(ip, ".")
+	if len(parts) == 4 {
+		parts[1] = "***"
+		parts[2] = "***"
+		return strings.Join(parts, ".")
+	}
+	// IPv6: mask the middle
+	parts = strings.Split(ip, ":")
+	if len(parts) >= 3 {
+		parts[1] = "***"
+		return strings.Join(parts, ":")
+	}
+	return ip
+}
 
 // helloIDs is the pool of uTLS ClientHello presets, impersonating real clients.
 var helloIDs = []utls.ClientHelloID{
@@ -144,7 +164,7 @@ func (p *connPool) dial() *poolConn {
 
 	rawConn, err := (&net.Dialer{Timeout: timeout}).Dial("tcp", serverAddr)
 	if err != nil {
-		log.Printf("[Pool] TCP dial failed %s: %v", serverAddr, err)
+		log.Printf("[Pool] TCP dial failed %s: %v", maskIP(serverAddr), err)
 		return nil
 	}
 
@@ -161,7 +181,7 @@ func (p *connPool) dial() *poolConn {
 	}
 	tlsConn.SetDeadline(time.Time{})
 
-	log.Printf("[Pool] new conn SNI=%s hello=%s -> %s", sni, helloID.Client, serverAddr)
+	log.Printf("[Pool] new conn SNI=%s hello=%s -> %s", sni, helloID.Client, maskIP(serverAddr))
 
 	p.mu.Lock()
 	p.total++

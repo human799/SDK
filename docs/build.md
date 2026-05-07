@@ -145,3 +145,27 @@ SDK（本地监听）
 ```
 
 SDK 侧每条连接随机选取一个 SNI，服务端证书 CN=goedge.cloud（自签），客户端跳过证书校验。
+
+
+
+
+1. 编译时去掉调试信息（最直接）
+   gomobile bind -target=android/arm64,android/amd64 -androidapi 21 \
+   -ldflags="-s -w" \
+   -o sdk.aar ./sdk
+   -s 去掉符号表，-w 去掉 DWARF 调试信息。通常能减少 30~40%。
+
+2. 只编译需要的架构
+   现在编了 arm64 + amd64，amd64 只有模拟器用得到，生产包可以只编 arm64：
+
+gomobile bind -target=android/arm64 -androidapi 21 \
+-ldflags="-s -w" \
+-o sdk.aar ./sdk
+直接砍掉一半体积。
+
+如果需要兼容老设备（32位 ARM）：
+
+
+gomobile bind -target=android/arm64,android/arm -androidapi 21 \
+-ldflags="-s -w" \
+-o sdk.aar ./sdk

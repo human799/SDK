@@ -39,7 +39,7 @@ func NewProxyConfig(serverHost string, serverPort int) *ProxyConfig {
 }
 
 // NewDefaultProxyClient creates a client with hardcoded demo config.
-// Forwarding server: 216.118.241.194:10443
+// Forwarding server: 216.*.*.194:10443
 // Local listen:      127.23.6.1:9527
 func NewDefaultProxyClient() *ProxyClient {
 	return &ProxyClient{
@@ -103,7 +103,7 @@ func (c *ProxyClient) Start() error {
 	}
 
 	log.Printf("[SDK] started, local %s -> server %s:%d (TLS=%v)",
-		ln.Addr(), c.config.ServerHost, c.config.ServerPort, c.config.TLSEnabled)
+		ln.Addr(), maskIP(c.config.ServerHost), c.config.ServerPort, c.config.TLSEnabled)
 
 	go c.acceptLoop()
 	return nil
@@ -182,7 +182,7 @@ func (c *ProxyClient) handleConn(local net.Conn) {
 	timeout := time.Duration(c.config.DialTimeout) * time.Second
 	remote, err := net.DialTimeout("tcp", serverAddr, timeout)
 	if err != nil {
-		log.Printf("[SDK] connect to server failed %s: %v", serverAddr, err)
+		log.Printf("[SDK] connect to server failed %s: %v", maskIP(serverAddr), err)
 		return
 	}
 	defer remote.Close()
