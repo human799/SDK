@@ -2,33 +2,52 @@
 package sdk
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
-// sniPool is the list of SNI hostnames rotated per connection to blend
-// traffic with common Chinese CDN/cloud domains.
+// sniPool is the list of SNI hostnames randomly selected per connection to
+// blend traffic with common Chinese CDN/cloud domains.
 var sniPool = []string{
 	"share.note.youdao.com",
 	"mail.163.com",
 	"www.sohu.com",
 	"im.qq.com",
 	"www.baidu.com",
+	"www.zhihu.com",
+	"static.zhihu.com",
+	"res.wx.qq.com",
+	"open.weixin.qq.com",
+	"music.163.com",
 }
 
-// sniIndex is an atomic counter for round-robin SNI selection.
-var sniIndex uint64
+// randomSNI returns a random SNI hostname from the pool.
+func randomSNI() string {
+	return sniPool[rand.Intn(len(sniPool))]
+}
 
-// nextSNI returns the next SNI hostname from the pool (round-robin).
-func nextSNI() string {
-	idx := atomic.AddUint64(&sniIndex, 1)
-	return sniPool[idx%uint64(len(sniPool))]
+// helloIDs is the pool of uTLS ClientHello presets to rotate through,
+// impersonating real browsers/OS TLS stacks.
+var helloIDs = []utls.ClientHelloID{
+	utls.HelloChrome_133,
+	utls.HelloChrome_120,
+	utls.HelloChrome_106_Shuffle,
+	utls.HelloFirefox_120,
+	utls.HelloFirefox_105,
+	utls.HelloIOS_14,
+	utls.HelloAndroid_11_OkHttp,
+}
+
+// randomHelloID returns a random uTLS ClientHello preset.
+func randomHelloID() utls.ClientHelloID {
+	return helloIDs[rand.Intn(len(helloIDs))]
 }
 
 // ProxyConfig holds the configuration for the proxy client.
@@ -177,23 +196,32 @@ func (c *ProxyClient) handleConn(local net.Conn) {
 	timeout := time.Duration(c.config.DialTimeout) * time.Second
 
 	if c.config.TLSEnabled {
-		sni := nextSNI()
-		tlsCfg := &tls.Config{
-			ServerName:         sni,
-			InsecureSkipVerify: true, // self-signed cert on server
-			MinVersion:         tls.VersionTLS12,
-			MaxVersion:         tls.VersionTLS13,
-		}
+		sni := randomSNI()
+		helloID := randomHelloID()
+
 		dialer := &net.Dialer{Timeout: timeout}
-		tlsConn, err := tls.DialWithDialer(dialer, "tcp", serverAddr, tlsCfg)
+		rawConn, err := dialer.Dial("tcp", serverAddr)
 		if err != nil {
-			log.Printf("[SDK] TLS connect failed (SNI=%s) %s: %v", sni, serverAddr, err)
+			log.Printf("[SDK] TCP connect failed %s: %v", serverAddr, err)
 			return
 		}
-		defer tlsConn.Close()
-		log.Printf("[SDK] TLS connected SNI=%s -> %s", sni, serverAddr)
 
-		// obfs mode: encode frames local→remote, decode frames remote→local
+		// uTLS: impersonate a real browser/OS TLS fingerprint
+		tlsConn := utls.UClient(rawConn, &utls.Config{
+			ServerName:         sni,
+			InsecureSkipVerify: true, // self-signed cert on server
+		}, helloID)
+
+		tlsConn.SetDeadline(time.Now().Add(timeout))
+		if err := tlsConn.Handshake(); err != nil {
+			rawConn.Close()
+			log.Printf("[SDK] uTLS handshake failed (SNI=%s hello=%s): %v", sni, helloID.Client, err)
+			return
+		}
+		tlsConn.SetDeadline(time.Time{}) // clear deadline after handshake
+		defer tlsConn.Close()
+		log.Printf("[SDK] uTLS connected SNI=%s hello=%s -> %s", sni, helloID.Client, serverAddr)
+
 		obfsRemote := newObfsConn(tlsConn)
 		relayObfs(local, obfsRemote)
 	} else {

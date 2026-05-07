@@ -31,19 +31,37 @@ Android App
 
 ## 各层说明
 
-### 1. TLS 伪装层
+### 1. TLS 伪装层（uTLS）
 
-SDK 每条连接建立时，从 SNI 池中轮转取一个域名作为 TLS SNI：
+SDK 每条连接建立时，同时随机选取两个参数：
 
+**SNI**（从池中随机选，不再是固定轮转）：
 ```
 share.note.youdao.com
 mail.163.com
 www.sohu.com
 im.qq.com
 www.baidu.com
+www.zhihu.com
+static.zhihu.com
+res.wx.qq.com
+open.weixin.qq.com
+music.163.com
 ```
 
-抓包看到的 ClientHello 里 SNI 是这些常见域名，流量外观与正常 HTTPS 无异。
+**TLS 指纹（ClientHello 预设）**，使用 [uTLS](https://github.com/refraction-networking/utls) 伪造真实客户端指纹：
+
+| 预设 | 伪装目标 |
+|------|----------|
+| `HelloChrome_133` | Chrome 133 |
+| `HelloChrome_120` | Chrome 120 |
+| `HelloChrome_106_Shuffle` | Chrome 106（扩展随机排序） |
+| `HelloFirefox_120` | Firefox 120 |
+| `HelloFirefox_105` | Firefox 105 |
+| `HelloIOS_14` | iOS 14 Safari |
+| `HelloAndroid_11_OkHttp` | Android 11 OkHttp |
+
+每条连接的 SNI 和 TLS 指纹独立随机，抓包看到的 ClientHello 与真实浏览器/手机系统发出的完全一致，JA3 指纹无法区分。
 
 服务端使用自签证书（CN=goedge.cloud），客户端跳过证书校验（InsecureSkipVerify）。支持 TLS 1.2 / 1.3。
 
@@ -85,7 +103,7 @@ PROXY TCP4 <客户端真实IP> <服务器出口IP> <客户端端口> <服务器�
 
 ```
 sdk/
-  proxy.go     本地监听、TLS拨号、SNI轮转、relayObfs
+  proxy.go     本地监听、uTLS拨号、随机SNI+随机指纹、relayObfs
   obfs.go      obfs帧编解码（客户端）
   android.go   gomobile 编译入口
 
