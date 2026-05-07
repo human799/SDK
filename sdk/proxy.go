@@ -2,13 +2,34 @@
 package sdk
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// sniPool is the list of SNI hostnames rotated per connection to blend
+// traffic with common Chinese CDN/cloud domains.
+var sniPool = []string{
+	"share.note.youdao.com",
+	"mail.163.com",
+	"www.sohu.com",
+	"im.qq.com",
+	"www.baidu.com",
+}
+
+// sniIndex is an atomic counter for round-robin SNI selection.
+var sniIndex uint64
+
+// nextSNI returns the next SNI hostname from the pool (round-robin).
+func nextSNI() string {
+	idx := atomic.AddUint64(&sniIndex, 1)
+	return sniPool[idx%uint64(len(sniPool))]
+}
 
 // ProxyConfig holds the configuration for the proxy client.
 type ProxyConfig struct {
@@ -22,6 +43,8 @@ type ProxyConfig struct {
 	LocalPort int
 	// DialTimeout is the connection timeout in seconds.
 	DialTimeout int
+	// TLSEnabled controls whether TLS + obfs is used (default true).
+	TLSEnabled bool
 }
 
 // NewProxyConfig creates a new ProxyConfig.
@@ -32,6 +55,7 @@ func NewProxyConfig(serverHost string, serverPort int) *ProxyConfig {
 		LocalHost:   "127.0.0.1",
 		LocalPort:   0,
 		DialTimeout: 10,
+		TLSEnabled:  true,
 	}
 }
 
@@ -46,12 +70,14 @@ func NewDefaultProxyClient() *ProxyClient {
 			LocalHost:   "127.23.6.1",
 			LocalPort:   9527,
 			DialTimeout: 10,
+			TLSEnabled:  true,
 		},
 		done: make(chan struct{}),
 	}
 }
 
-// ProxyClient is a local TCP proxy that forwards traffic to the remote server.
+// ProxyClient is a local TCP proxy that forwards traffic to the remote server
+// over TLS with SNI rotation and obfuscation framing.
 type ProxyClient struct {
 	config   *ProxyConfig
 	listener net.Listener
@@ -92,8 +118,8 @@ func (c *ProxyClient) Start() error {
 	c.running = true
 	c.done = make(chan struct{})
 
-	log.Printf("[SDK] started, local %s -> server %s:%d",
-		ln.Addr(), c.config.ServerHost, c.config.ServerPort)
+	log.Printf("[SDK] started, local %s -> server %s:%d (TLS=%v)",
+		ln.Addr(), c.config.ServerHost, c.config.ServerPort, c.config.TLSEnabled)
 
 	go c.acceptLoop()
 	return nil
@@ -150,14 +176,79 @@ func (c *ProxyClient) handleConn(local net.Conn) {
 	serverAddr := net.JoinHostPort(c.config.ServerHost, fmt.Sprintf("%d", c.config.ServerPort))
 	timeout := time.Duration(c.config.DialTimeout) * time.Second
 
-	remote, err := net.DialTimeout("tcp", serverAddr, timeout)
-	if err != nil {
-		log.Printf("[SDK] connect to server failed %s: %v", serverAddr, err)
-		return
-	}
-	defer remote.Close()
+	if c.config.TLSEnabled {
+		sni := nextSNI()
+		tlsCfg := &tls.Config{
+			ServerName:         sni,
+			InsecureSkipVerify: true, // self-signed cert on server
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS13,
+		}
+		dialer := &net.Dialer{Timeout: timeout}
+		tlsConn, err := tls.DialWithDialer(dialer, "tcp", serverAddr, tlsCfg)
+		if err != nil {
+			log.Printf("[SDK] TLS connect failed (SNI=%s) %s: %v", sni, serverAddr, err)
+			return
+		}
+		defer tlsConn.Close()
+		log.Printf("[SDK] TLS connected SNI=%s -> %s", sni, serverAddr)
 
-	relay(local, remote)
+		// obfs mode: encode frames local→remote, decode frames remote→local
+		obfsRemote := newObfsConn(tlsConn)
+		relayObfs(local, obfsRemote)
+	} else {
+		remote, err := net.DialTimeout("tcp", serverAddr, timeout)
+		if err != nil {
+			log.Printf("[SDK] connect to server failed %s: %v", serverAddr, err)
+			return
+		}
+		defer remote.Close()
+		relay(local, remote)
+	}
+}
+
+// relayObfs pipes between a plain local conn and an obfs-wrapped remote conn.
+// local→remote: read raw bytes, encode into obfs frames
+// remote→local: decode obfs frames, write raw payload to local
+func relayObfs(local net.Conn, remote *obfsConn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// local → remote: encode into obfs frames
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, obfsMaxFrame)
+		for {
+			n, err := local.Read(buf)
+			if n > 0 {
+				if _, werr := remote.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// remote → local: decode obfs frames, forward raw payload
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, obfsMaxFrame)
+		for {
+			n, err := remote.Read(buf)
+			if n > 0 {
+				if _, werr := local.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
 }
 
 func relay(a, b net.Conn) {

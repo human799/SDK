@@ -1,0 +1,16 @@
+# compiled binaries
+proxy-server
+proxy-server.exe
+
+# TLS certificates
+*.crt
+*.key
+*.pem
+
+# gomobile output
+sdk.aar
+sdk-sources.jar
+
+# Go build cache
+*.test
+*.out
