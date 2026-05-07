@@ -13,14 +13,17 @@ import (
 	"proxy-system/server/obfs"
 )
 
+// decoyRedirectURL is where plain HTTP/non-TLS probes are redirected.
+const decoyRedirectURL = "https://www.baidu.com"
+
 // Forwarder manages all forwarding connections.
 type Forwarder struct {
-	target  string // upstream address host:port
-	tlsCfg  *tls.Config
-	mu      sync.Mutex
-	conns   map[net.Conn]struct{}
-	done    chan struct{}
-	closed  bool
+	target string // upstream address host:port
+	tlsCfg *tls.Config
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	done   chan struct{}
+	closed bool
 }
 
 // Config holds Forwarder options.
@@ -51,15 +54,6 @@ func New(cfg Config) (*Forwarder, error) {
 	}
 
 	return f, nil
-}
-
-// WrapTLS upgrades a raw TCP listener connection to TLS if configured.
-// Returns the (possibly wrapped) conn and whether obfs should be applied.
-func (f *Forwarder) WrapTLS(raw net.Conn) (net.Conn, bool) {
-	if f.tlsCfg == nil {
-		return raw, false
-	}
-	return tls.Server(raw, f.tlsCfg), true
 }
 
 // Done returns the close signal channel.
@@ -94,9 +88,10 @@ func (f *Forwarder) removeConn(c net.Conn) {
 }
 
 // Handle processes one inbound connection:
-//  1. TLS handshake (if configured)
-//  2. Unwrap obfs framing (pipe mode: decode frames, stream to upstream)
-//  3. Forward to upstream with PROXY Protocol v1
+//  1. Sniff first byte: non-TLS traffic (browsers/scanners) gets a decoy HTTP redirect
+//  2. TLS handshake (if configured)
+//  3. Sniff first byte inside TLS: non-obfs gets a decoy HTTP redirect
+//  4. Unwrap obfs framing → forward to upstream with PROXY Protocol v1
 func (f *Forwarder) Handle(raw net.Conn) {
 	f.addConn(raw)
 	defer func() {
@@ -104,13 +99,54 @@ func (f *Forwarder) Handle(raw net.Conn) {
 		raw.Close()
 	}()
 
-	client, useObfs := f.WrapTLS(raw)
-	if client != raw {
-		f.addConn(client)
+	// Peek exactly 1 byte without buffering extras.
+	// TLS ClientHello always starts with 0x16 (content type: handshake).
+	oneByte := make([]byte, 1)
+	if _, err := io.ReadFull(raw, oneByte); err != nil {
+		return
+	}
+
+	// Restore the peeked byte.
+	pconn := &peekedConn{Conn: raw, Reader: io.MultiReader(newByteReader(oneByte[0]), raw)}
+
+	if oneByte[0] != 0x16 {
+		log.Printf("[Forwarder] non-TLS probe from %s → decoy redirect", raw.RemoteAddr())
+		sendDecoyRedirect(pconn)
+		return
+	}
+
+	// TLS path
+	var client net.Conn = pconn
+	useObfs := false
+	if f.tlsCfg != nil {
+		tlsConn := tls.Server(pconn, f.tlsCfg)
+		f.addConn(tlsConn)
 		defer func() {
-			f.removeConn(client)
-			client.Close()
+			f.removeConn(tlsConn)
+			tlsConn.Close()
 		}()
+
+		if err := tlsConn.Handshake(); err != nil {
+			log.Printf("[Forwarder] TLS handshake failed from %s: %v", raw.RemoteAddr(), err)
+			return
+		}
+
+		// Peek exactly 1 byte inside TLS.
+		// obfs magic starts with 0xDE; browser HTTP starts with 'G','P','H', etc.
+		if _, err := io.ReadFull(tlsConn, oneByte); err != nil {
+			return
+		}
+
+		if oneByte[0] != 0xDE {
+			log.Printf("[Forwarder] non-obfs HTTPS probe from %s → decoy redirect", raw.RemoteAddr())
+			innerConn := &peekedConn{Conn: tlsConn, Reader: io.MultiReader(newByteReader(oneByte[0]), tlsConn)}
+			sendDecoyRedirect(innerConn)
+			return
+		}
+
+		// Put the 0xDE byte back for obfs decoder.
+		client = &peekedConn{Conn: tlsConn, Reader: io.MultiReader(newByteReader(oneByte[0]), tlsConn)}
+		useObfs = true
 	}
 
 	remote, err := net.DialTimeout("tcp", f.target, 10*time.Second)
@@ -124,29 +160,62 @@ func (f *Forwarder) Handle(raw net.Conn) {
 
 	log.Printf("[Forwarder] %s -> %s (obfs=%v)", raw.RemoteAddr(), f.target, useObfs)
 
-	// Inject PROXY Protocol v1 so upstream sees real client IP
 	if err := sendProxyProtocolV1(remote, raw.RemoteAddr(), remote.LocalAddr()); err != nil {
 		log.Printf("[Forwarder] PPv1 failed: %v", err)
 		return
 	}
 
 	if useObfs {
-		// obfs mode: decode frames client→remote, encode frames remote→client
-		obfsClient := obfs.New(client)
-		relayObfs(obfsClient, remote)
+		// Use NewWithReader so the peeked 0xDE byte is not lost.
+		pc := client.(*peekedConn)
+		relayObfs(obfs.NewWithReader(pc.Conn, pc.Reader), remote)
 	} else {
 		relay(client, remote)
 	}
 }
 
+// peekedConn wraps net.Conn with a pre-buffered reader after peeking bytes.
+type peekedConn struct {
+	net.Conn
+	Reader io.Reader
+}
+
+func (c *peekedConn) Read(b []byte) (int, error) { return c.Reader.Read(b) }
+
+// newByteReader returns an io.Reader that yields exactly one byte.
+func newByteReader(b byte) io.Reader {
+	return &singleByteReader{b: b, done: false}
+}
+
+type singleByteReader struct {
+	b    byte
+	done bool
+}
+
+func (r *singleByteReader) Read(p []byte) (int, error) {
+	if r.done || len(p) == 0 {
+		return 0, io.EOF
+	}
+	p[0] = r.b
+	r.done = true
+	return 1, nil
+}
+
+// sendDecoyRedirect writes a minimal HTTP 302 response redirecting to decoyRedirectURL.
+func sendDecoyRedirect(c net.Conn) {
+	resp := "HTTP/1.1 302 Found\r\n" +
+		"Location: " + decoyRedirectURL + "\r\n" +
+		"Content-Length: 0\r\n" +
+		"Connection: close\r\n" +
+		"\r\n"
+	c.Write([]byte(resp)) //nolint:errcheck
+}
+
 // relayObfs pipes between an obfs connection and a plain TCP connection.
-// client→remote: read full obfs frames, write raw payload to remote
-// remote→client: read raw bytes from remote, write obfs frames to client
 func relayObfs(client *obfs.Conn, remote net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// client → remote: decode obfs frames, forward raw payload
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, obfs.MaxFrame)
@@ -163,7 +232,6 @@ func relayObfs(client *obfs.Conn, remote net.Conn) {
 		}
 	}()
 
-	// remote → client: read raw bytes, encode into obfs frames
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, obfs.MaxFrame)

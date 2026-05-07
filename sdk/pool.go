@@ -29,7 +29,7 @@ var sniPool = []string{
 func randomSNI() string { return sniPool[rand.Intn(len(sniPool))] }
 
 // maskIP replaces the middle segments of an IP with *.
-// "216.118.241.194" → "216.***.241.194"
+// "216.118.241.194" → "216.***.***.194"
 // "2001:db8::1"     → "2001:***::1"
 func maskIP(ip string) string {
 	parts := strings.Split(ip, ".")

@@ -20,11 +20,17 @@ const (
 // Conn wraps a net.Conn with obfuscation framing (same protocol as sdk/obfs.go).
 type Conn struct {
 	net.Conn
+	r io.Reader // read from this (may include peeked bytes)
 }
 
 // New wraps c with the obfs framing layer.
 func New(c net.Conn) *Conn {
-	return &Conn{Conn: c}
+	return &Conn{Conn: c, r: c}
+}
+
+// NewWithReader wraps c but reads from r (used when bytes have been peeked).
+func NewWithReader(c net.Conn, r io.Reader) *Conn {
+	return &Conn{Conn: c, r: r}
 }
 
 // Write splits p into obfsMaxFrame-sized chunks and sends each as one frame.
@@ -66,10 +72,10 @@ func (o *Conn) writeFrame(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Read unwraps one obfs frame. Returns error if frame exceeds obfsMaxFrame.
+// Read unwraps one obfs frame. Returns error if frame exceeds MaxFrame.
 func (o *Conn) Read(buf []byte) (int, error) {
 	header := make([]byte, 9)
-	if _, err := io.ReadFull(o.Conn, header); err != nil {
+	if _, err := io.ReadFull(o.r, header); err != nil {
 		return 0, err
 	}
 
@@ -86,7 +92,7 @@ func (o *Conn) Read(buf []byte) (int, error) {
 
 	if paddingLen > 0 {
 		discard := make([]byte, paddingLen)
-		if _, err := io.ReadFull(o.Conn, discard); err != nil {
+		if _, err := io.ReadFull(o.r, discard); err != nil {
 			return 0, err
 		}
 	}
@@ -95,7 +101,7 @@ func (o *Conn) Read(buf []byte) (int, error) {
 		return 0, fmt.Errorf("obfs: buf too small (%d < %d)", len(buf), payloadLen)
 	}
 
-	return io.ReadFull(o.Conn, buf[:payloadLen])
+	return io.ReadFull(o.r, buf[:payloadLen])
 }
 
 func randomByte() byte {

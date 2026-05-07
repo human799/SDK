@@ -169,3 +169,12 @@ gomobile bind -target=android/arm64 -androidapi 21 \
 gomobile bind -target=android/arm64,android/arm -androidapi 21 \
 -ldflags="-s -w" \
 -o sdk.aar ./sdk
+
+
+启动
+nohup ./proxy-server \
+-listen 0.0.0.0:10443 \
+-target 52.128.229.186:10443 \
+-cert server.crt \
+-key server.key \
+> proxy.log 2>&1 &
