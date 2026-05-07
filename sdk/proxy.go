@@ -5,50 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
-
-	utls "github.com/refraction-networking/utls"
 )
-
-// sniPool is the list of SNI hostnames randomly selected per connection to
-// blend traffic with common Chinese CDN/cloud domains.
-var sniPool = []string{
-	"share.note.youdao.com",
-	"mail.163.com",
-	"www.sohu.com",
-	"im.qq.com",
-	"www.baidu.com",
-	"www.zhihu.com",
-	"static.zhihu.com",
-	"res.wx.qq.com",
-	"open.weixin.qq.com",
-	"music.163.com",
-}
-
-// randomSNI returns a random SNI hostname from the pool.
-func randomSNI() string {
-	return sniPool[rand.Intn(len(sniPool))]
-}
-
-// helloIDs is the pool of uTLS ClientHello presets to rotate through,
-// impersonating real browsers/OS TLS stacks.
-var helloIDs = []utls.ClientHelloID{
-	utls.HelloChrome_133,
-	utls.HelloChrome_120,
-	utls.HelloChrome_106_Shuffle,
-	utls.HelloFirefox_120,
-	utls.HelloFirefox_105,
-	utls.HelloIOS_14,
-	utls.HelloAndroid_11_OkHttp,
-}
-
-// randomHelloID returns a random uTLS ClientHello preset.
-func randomHelloID() utls.ClientHelloID {
-	return helloIDs[rand.Intn(len(helloIDs))]
-}
 
 // ProxyConfig holds the configuration for the proxy client.
 type ProxyConfig struct {
@@ -100,6 +60,7 @@ func NewDefaultProxyClient() *ProxyClient {
 type ProxyClient struct {
 	config   *ProxyConfig
 	listener net.Listener
+	pool     *connPool
 	mu       sync.Mutex
 	running  bool
 	done     chan struct{}
@@ -137,6 +98,10 @@ func (c *ProxyClient) Start() error {
 	c.running = true
 	c.done = make(chan struct{})
 
+	if c.config.TLSEnabled {
+		c.pool = newConnPool(c.config)
+	}
+
 	log.Printf("[SDK] started, local %s -> server %s:%d (TLS=%v)",
 		ln.Addr(), c.config.ServerHost, c.config.ServerPort, c.config.TLSEnabled)
 
@@ -154,6 +119,10 @@ func (c *ProxyClient) Stop() {
 	c.running = false
 	close(c.done)
 	c.listener.Close()
+	if c.pool != nil {
+		c.pool.close()
+		c.pool = nil
+	}
 }
 
 // LocalPort returns the actual local listening port after Start.
@@ -192,55 +161,41 @@ func (c *ProxyClient) acceptLoop() {
 func (c *ProxyClient) handleConn(local net.Conn) {
 	defer local.Close()
 
+	if c.config.TLSEnabled {
+		pc := c.pool.get()
+		if pc == nil {
+			log.Printf("[SDK] pool: no connection available")
+			return
+		}
+		err := relayObfs(local, pc.conn)
+		if err != nil {
+			// connection is broken, discard it
+			c.pool.discard(pc)
+		} else {
+			c.pool.put(pc)
+		}
+		return
+	}
+
+	// plain TCP fallback
 	serverAddr := net.JoinHostPort(c.config.ServerHost, fmt.Sprintf("%d", c.config.ServerPort))
 	timeout := time.Duration(c.config.DialTimeout) * time.Second
-
-	if c.config.TLSEnabled {
-		sni := randomSNI()
-		helloID := randomHelloID()
-
-		dialer := &net.Dialer{Timeout: timeout}
-		rawConn, err := dialer.Dial("tcp", serverAddr)
-		if err != nil {
-			log.Printf("[SDK] TCP connect failed %s: %v", serverAddr, err)
-			return
-		}
-
-		// uTLS: impersonate a real browser/OS TLS fingerprint
-		tlsConn := utls.UClient(rawConn, &utls.Config{
-			ServerName:         sni,
-			InsecureSkipVerify: true, // self-signed cert on server
-		}, helloID)
-
-		tlsConn.SetDeadline(time.Now().Add(timeout))
-		if err := tlsConn.Handshake(); err != nil {
-			rawConn.Close()
-			log.Printf("[SDK] uTLS handshake failed (SNI=%s hello=%s): %v", sni, helloID.Client, err)
-			return
-		}
-		tlsConn.SetDeadline(time.Time{}) // clear deadline after handshake
-		defer tlsConn.Close()
-		log.Printf("[SDK] uTLS connected SNI=%s hello=%s -> %s", sni, helloID.Client, serverAddr)
-
-		obfsRemote := newObfsConn(tlsConn)
-		relayObfs(local, obfsRemote)
-	} else {
-		remote, err := net.DialTimeout("tcp", serverAddr, timeout)
-		if err != nil {
-			log.Printf("[SDK] connect to server failed %s: %v", serverAddr, err)
-			return
-		}
-		defer remote.Close()
-		relay(local, remote)
+	remote, err := net.DialTimeout("tcp", serverAddr, timeout)
+	if err != nil {
+		log.Printf("[SDK] connect to server failed %s: %v", serverAddr, err)
+		return
 	}
+	defer remote.Close()
+	relay(local, remote)
 }
 
 // relayObfs pipes between a plain local conn and an obfs-wrapped remote conn.
-// local→remote: read raw bytes, encode into obfs frames
-// remote→local: decode obfs frames, write raw payload to local
-func relayObfs(local net.Conn, remote *obfsConn) {
+// Returns a non-nil error if the remote connection encountered an error.
+func relayObfs(local net.Conn, remote *obfsConn) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
+	var remoteErr error
+	var mu sync.Mutex
 
 	// local → remote: encode into obfs frames
 	go func() {
@@ -250,6 +205,9 @@ func relayObfs(local net.Conn, remote *obfsConn) {
 			n, err := local.Read(buf)
 			if n > 0 {
 				if _, werr := remote.Write(buf[:n]); werr != nil {
+					mu.Lock()
+					remoteErr = werr
+					mu.Unlock()
 					return
 				}
 			}
@@ -271,12 +229,16 @@ func relayObfs(local net.Conn, remote *obfsConn) {
 				}
 			}
 			if err != nil {
+				mu.Lock()
+				remoteErr = err
+				mu.Unlock()
 				return
 			}
 		}
 	}()
 
 	wg.Wait()
+	return remoteErr
 }
 
 func relay(a, b net.Conn) {
