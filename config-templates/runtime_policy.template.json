@@ -1,0 +1,17 @@
+{
+  "state_machine": {
+    "NormalToDegradedFail": 2,
+    "DegradedToAttackFail": 4,
+    "DegradedToNormalSuccess": 3,
+    "AttackToRecoverSuccess": 5,
+    "RecoverToAttackFail": 2,
+    "RecoverToNormalSuccess": 5,
+    "EmergencyToRecoverSuccess": 2
+  },
+  "circuit_breaker": {
+    "max_failures": 3,
+    "base_backoff_ms": 1000,
+    "max_backoff_ms": 60000
+  }
+}
+

@@ -44,10 +44,10 @@ func NewProxyConfig(serverHost string, serverPort int) *ProxyConfig {
 func NewDefaultProxyClient() *ProxyClient {
 	return &ProxyClient{
 		config: &ProxyConfig{
-			ServerHost:  "216.118.241.194",
-			ServerPort:  10443,
-			LocalHost:   "127.23.6.1",
-			LocalPort:   9527,
+			ServerHost:  "",
+			ServerPort:  0,
+			LocalHost:   "127.0.0.1",
+			LocalPort:   0,
 			DialTimeout: 10,
 			TLSEnabled:  true,
 		},
@@ -81,6 +81,9 @@ func (c *ProxyClient) Start() error {
 
 	if c.running {
 		return fmt.Errorf("proxy is already running")
+	}
+	if c.config.ServerHost == "" || c.config.ServerPort <= 0 {
+		return fmt.Errorf("server config is required: empty host or invalid port")
 	}
 
 	localHost := c.config.LocalHost
