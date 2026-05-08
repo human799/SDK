@@ -3,6 +3,7 @@
 ## 最小流程
 
 1. `b := sdk.NewSDKBootstrap()`
+2. `b.SetDataDir(appDataDir)`（推荐，自动持久化 UUID+缓存）
 2. `b.init(secret)`
 3. `b.prepare()`
 4. `b.setLocalPort(0)`
@@ -15,6 +16,7 @@
 - `loadRuntimePolicyFile(path)`：加载状态机/熔断策略
 - `setDeviceUUID(uuid)`：设置持久化 UUID
 - `setCacheFile(path)`：设置缓存文件路径
+- `setDataDir(path)`：统一设置 SDK 数据目录（自动管理 UUID/缓存）
 
 ## Secret 说明
 

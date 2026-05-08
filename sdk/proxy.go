@@ -64,6 +64,7 @@ type ProxyClient struct {
 	mu       sync.Mutex
 	running  bool
 	done     chan struct{}
+	onConnectResult func(success bool)
 }
 
 // NewProxyClient creates a new ProxyClient instance.
@@ -72,6 +73,14 @@ func NewProxyClient(config *ProxyConfig) *ProxyClient {
 		config: config,
 		done:   make(chan struct{}),
 	}
+}
+
+// SetConnectResultHook sets a callback for per-connection result reporting.
+// success=false means connect/relay failed; success=true means one relay session completed.
+func (c *ProxyClient) SetConnectResultHook(hook func(success bool)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onConnectResult = hook
 }
 
 // Start starts the local listener.
@@ -168,14 +177,17 @@ func (c *ProxyClient) handleConn(local net.Conn) {
 		pc := c.pool.get()
 		if pc == nil {
 			log.Printf("[SDK] pool: no connection available")
+			c.reportConnectResult(false)
 			return
 		}
 		err := relayObfs(local, pc.conn)
 		if err != nil {
 			// connection is broken, discard it
 			c.pool.discard(pc)
+			c.reportConnectResult(false)
 		} else {
 			c.pool.put(pc)
+			c.reportConnectResult(true)
 		}
 		return
 	}
@@ -186,10 +198,12 @@ func (c *ProxyClient) handleConn(local net.Conn) {
 	remote, err := net.DialTimeout("tcp", serverAddr, timeout)
 	if err != nil {
 		log.Printf("[SDK] connect to server failed %s: %v", maskIP(serverAddr), err)
+		c.reportConnectResult(false)
 		return
 	}
 	defer remote.Close()
 	relay(local, remote)
+	c.reportConnectResult(true)
 }
 
 // relayObfs pipes between a plain local conn and an obfs-wrapped remote conn.
@@ -259,4 +273,13 @@ func relay(a, b net.Conn) {
 	go pipe(a, b)
 	go pipe(b, a)
 	wg.Wait()
+}
+
+func (c *ProxyClient) reportConnectResult(success bool) {
+	c.mu.Lock()
+	hook := c.onConnectResult
+	c.mu.Unlock()
+	if hook != nil {
+		hook(success)
+	}
 }

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,22 +29,36 @@ type SDKBootstrap struct {
 	candidates  []string
 	currentNode string
 	cachePath   string
+	dataDir     string
+	uuidPath    string
 	nextDNSAt   time.Time
 
 	lastFallbackReason string
+	lastNetworkOK      bool
+	lastNetworkCheckAt time.Time
 	prepared           bool
 	lastError          string
 	updatedAt          time.Time
 }
 
 func NewSDKBootstrap() *SDKBootstrap {
-	return &SDKBootstrap{
+	b := &SDKBootstrap{
 		client:    NewDefaultProxyClient(),
 		state:     NewStateMachine(),
 		breaker:   NewCircuitBreaker(),
 		cachePath: "sdk_cache.json",
+		dataDir:   ".",
+		uuidPath:  "sdk_device_uuid.txt",
 		updatedAt: time.Now(),
 	}
+	b.client.SetConnectResultHook(func(success bool) {
+		node := b.currentNodeSnapshot()
+		if node == "" {
+			return
+		}
+		b.ReportConnectResult(node, success)
+	})
+	return b
 }
 
 func (b *SDKBootstrap) ConfigureStateMachine(cfg StateMachineConfig) {
@@ -88,7 +104,7 @@ func (b *SDKBootstrap) Init(secret string) error {
 	}
 	b.secretToken, b.payload = secret, payload
 	if b.deviceUUID == "" {
-		b.deviceUUID = newDeviceUUID()
+		b.loadOrCreateDeviceUUIDLocked()
 	}
 	b.prepared, b.lastError, b.updatedAt = false, "", time.Now()
 	return nil
@@ -112,6 +128,24 @@ func (b *SDKBootstrap) Prepare() error {
 	cacheData, _ := loadSDKCache(b.cachePath)
 	groups, updatedCache, err := resolveControlPlane(ctx, &payloadCopy, cacheData)
 	if err != nil {
+		// Startup fallback: if control-plane fetch fails, try app_domain directly
+		// so the app can still boot in degraded mode.
+		if payloadCopy.AppDomain != "" {
+			host, derr := resolveAppDomainHost(payloadCopy.AppDomain)
+			if derr == nil {
+				port := 10443
+				b.mu.Lock()
+				b.client.config.ServerHost = host
+				b.client.config.ServerPort = port
+				b.currentNode = net.JoinHostPort(host, strconv.Itoa(port))
+				b.fixedSet = FixedNodeSet{}
+				b.candidates = nil
+				b.lastFallbackReason = "prepare_control_plane_failed_use_domain"
+				b.prepared, b.lastError, b.updatedAt = true, "", time.Now()
+				b.mu.Unlock()
+				return nil
+			}
+		}
 		return b.fail(fmt.Sprintf("resolve control plane failed: %v", err))
 	}
 	_ = saveSDKCache(b.cachePath, updatedCache)
@@ -124,6 +158,14 @@ func (b *SDKBootstrap) Prepare() error {
 	host, port, err := parseEndpoint(primary)
 	if err != nil {
 		return b.fail(fmt.Sprintf("invalid primary endpoint: %v", err))
+	}
+	// Fast-path: if selected primary is unreachable, immediately try app_domain
+	// fallback so app startup is not blocked by a known bad node.
+	if !isEndpointReachable(host, port, 1500*time.Millisecond) && payloadCopy.AppDomain != "" {
+		if dh, derr := resolveAppDomainHost(payloadCopy.AppDomain); derr == nil {
+			host = dh
+			primary = net.JoinHostPort(host, strconv.Itoa(port))
+		}
 	}
 
 	b.mu.Lock()
@@ -188,6 +230,7 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 	} else {
 		b.breaker.RecordFailure(node, time.Now())
 		if node == b.currentNode {
+			switched := false
 			for _, n := range b.candidates {
 				if !b.breaker.Allow(n, time.Now()) {
 					continue
@@ -199,9 +242,16 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 				b.client.config.ServerHost, b.client.config.ServerPort = host, port
 				b.currentNode, b.candidates = n, StableFallbackOrder(b.deviceUUID, b.fixedSet, n)
 				b.lastFallbackReason = "fixed_set_switch"
+				switched = true
 				break
 			}
-			if node == b.currentNode {
+			if !switched {
+				// Distinguish local network failure from node-specific failure.
+				b.lastNetworkOK = checkBaiduReachable()
+				b.lastNetworkCheckAt = time.Now()
+				if !b.lastNetworkOK {
+					b.lastFallbackReason = "network_unreachable"
+				}
 				b.tryDomainFallbackLocked()
 			}
 		}
@@ -225,6 +275,8 @@ func (b *SDKBootstrap) Status() string {
 		LastFallbackReason string `json:"last_fallback_reason,omitempty"`
 		CurrentNodeFailureCount int `json:"current_node_failures"`
 		CurrentNodeOpenUntil int64 `json:"current_node_open_until_unix,omitempty"`
+		LastNetworkOK bool `json:"last_network_ok"`
+		LastNetworkCheckAt int64 `json:"last_network_check_unix,omitempty"`
 		UpdatedAt int64 `json:"updated_at_unix"`
 	}
 	failCnt, openUntil := 0, int64(0)
@@ -239,6 +291,7 @@ func (b *SDKBootstrap) Status() string {
 		FixedSet: b.fixedSet, Current: b.currentNode, Candidates: b.candidates,
 		NextDNSAt: b.nextDNSAt.Unix(), LastFallbackReason: b.lastFallbackReason,
 		CurrentNodeFailureCount: failCnt, CurrentNodeOpenUntil: openUntil, UpdatedAt: b.updatedAt.Unix(),
+		LastNetworkOK: b.lastNetworkOK, LastNetworkCheckAt: b.lastNetworkCheckAt.Unix(),
 	})
 	if err != nil {
 		return `{"last_error":"status marshal failed"}`
@@ -252,8 +305,32 @@ func (b *SDKBootstrap) SetDeviceUUID(uuid string) error {
 		return b.failLocked("empty device uuid")
 	}
 	b.deviceUUID = uuid
+	_ = b.persistDeviceUUIDLocked()
 	b.updatedAt = time.Now()
 	return nil
+}
+
+// SetDataDir sets cross-platform SDK data directory for cache/uuid files.
+// Android/iOS should pass app private files directory; Windows can pass app data dir.
+func (b *SDKBootstrap) SetDataDir(path string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return b.failLocked("empty data dir")
+	}
+	b.dataDir = p
+	b.cachePath = filepath.Join(p, "sdk_cache.json")
+	b.uuidPath = filepath.Join(p, "sdk_device_uuid.txt")
+	b.updatedAt = time.Now()
+	return nil
+}
+
+// DeviceUUID returns current in-memory device uuid.
+func (b *SDKBootstrap) DeviceUUID() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.deviceUUID
 }
 func (b *SDKBootstrap) SetCacheFile(path string) error {
 	b.mu.Lock(); defer b.mu.Unlock()
@@ -320,6 +397,28 @@ func randomLabel(n int) string {
 	return string(buf)
 }
 
+func isEndpointReachable(host string, port int, timeout time.Duration) bool {
+	if host == "" || port <= 0 {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func checkBaiduReachable() bool {
+	// Android environments may block ICMP ping; TCP probe is more reliable.
+	conn, err := net.DialTimeout("tcp", "www.baidu.com:443", 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 func newDeviceUUID() string {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
@@ -343,5 +442,37 @@ func (b *SDKBootstrap) failLocked(msg string) error {
 	b.lastError = msg
 	b.updatedAt = time.Now()
 	return errors.New(msg)
+}
+
+func (b *SDKBootstrap) loadOrCreateDeviceUUIDLocked() {
+	if b.deviceUUID != "" {
+		return
+	}
+	if s, err := os.ReadFile(b.uuidPath); err == nil {
+		v := strings.TrimSpace(string(s))
+		if v != "" {
+			b.deviceUUID = v
+			return
+		}
+	}
+	b.deviceUUID = newDeviceUUID()
+	_ = b.persistDeviceUUIDLocked()
+}
+
+func (b *SDKBootstrap) persistDeviceUUIDLocked() error {
+	if b.deviceUUID == "" {
+		return nil
+	}
+	dir := filepath.Dir(b.uuidPath)
+	if dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	return os.WriteFile(b.uuidPath, []byte(b.deviceUUID), 0o600)
+}
+
+func (b *SDKBootstrap) currentNodeSnapshot() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.currentNode
 }
 
