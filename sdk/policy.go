@@ -15,6 +15,9 @@ type RuntimePolicy struct {
 	NetworkSwitchProtectSec      int                      `json:"network_switch_protect_sec,omitempty"`
 	HighAvailabilityHeartbeatSec int                      `json:"high_availability_heartbeat_sec,omitempty"`
 	RecentSuccessPriority        bool                     `json:"recent_success_priority,omitempty"`
+	// Node health checker
+	HealthCheckIntervalSec       int                      `json:"health_check_interval_sec,omitempty"`
+	HealthCheckTimeoutMs         int                      `json:"health_check_timeout_ms,omitempty"`
 }
 type CircuitBreakerConfigFile struct {
 	MaxFailures         int `json:"max_failures"`

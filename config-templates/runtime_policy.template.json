@@ -20,5 +20,7 @@
   "dns_persist_failures": 3,
   "network_switch_protect_sec": 8,
   "high_availability_heartbeat_sec": 60,
-  "recent_success_priority": true
+  "recent_success_priority": true,
+  "health_check_interval_sec": 300,
+  "health_check_timeout_ms": 3000
 }

@@ -16,44 +16,64 @@ import (
 	"time"
 )
 
+type NodeHealth struct {
+    Node       string
+    Healthy    bool
+    LastCheck  time.Time
+    RTT        time.Duration
+    LastSuccess time.Time
+}
+
+type NodeHealthChecker struct {
+    mu       sync.Mutex
+    health   map[string]NodeHealth
+    interval time.Duration
+    timeout  time.Duration
+    stop     chan struct{}
+    running  bool
+}
+
 type SDKBootstrap struct {
-	mu sync.Mutex
+    mu sync.Mutex
 
-	secretToken string
-	payload     *SecretPayload
-	client      *ProxyClient
-	state       *StateMachine
-	breaker     *CircuitBreaker
-	deviceUUID  string
-	fixedSet    FixedNodeSet
-	candidates  []string
-	currentNode string
-	cachePath   string
-	dataDir     string
-	uuidPath    string
-	nextDNSAt   time.Time
+    secretToken string
+    payload     *SecretPayload
+    client      *ProxyClient
+    state       *StateMachine
+    breaker     *CircuitBreaker
+    deviceUUID  string
+    fixedSet    FixedNodeSet
+    candidates  []string
+    currentNode string
+    cachePath   string
+    dataDir     string
+    uuidPath    string
+    nextDNSAt   time.Time
 
-	lastFallbackReason string
-	lastNetworkOK      bool
-	lastNetworkCheckAt time.Time
-	prepared           bool
-	lastError          string
-	updatedAt          time.Time
-	autoRefreshInterval time.Duration
-	autoRefreshStop     chan struct{}
-	autoRefreshRunning  bool
+    lastFallbackReason string
+    lastNetworkOK      bool
+    lastNetworkCheckAt time.Time
+    prepared           bool
+    lastError          string
+    updatedAt          time.Time
+    autoRefreshInterval time.Duration
+    autoRefreshStop     chan struct{}
+    autoRefreshRunning  bool
 
-	// Extreme scenarios improvements
-	stateMinDwellSec           int
-	networkSwitchProtectSec    int
-	networkSwitchLastAt        time.Time
-	dnsRefreshShortSec         int
-	dnsRefreshLongSec          int
-	dnsPersistFailures         int
-	dnsPersistFailuresCount    int
-	highAvailabilityHeartbeatSec int
-	recentSuccessPriority      bool
-	lastSuccessNode            string
+    // Extreme scenarios improvements
+    stateMinDwellSec           int
+    networkSwitchProtectSec    int
+    networkSwitchLastAt        time.Time
+    dnsRefreshShortSec         int
+    dnsRefreshLongSec          int
+    dnsPersistFailures         int
+    dnsPersistFailuresCount    int
+    highAvailabilityHeartbeatSec int
+    recentSuccessPriority      bool
+    lastSuccessNode            string
+
+    // Node health checker
+    healthChecker *NodeHealthChecker
 }
 
 func NewSDKBootstrap() *SDKBootstrap {
@@ -75,6 +95,12 @@ func NewSDKBootstrap() *SDKBootstrap {
 		dnsPersistFailures:         3,
 		highAvailabilityHeartbeatSec: 60,
 		recentSuccessPriority:      true,
+		// Node health checker
+		healthChecker: &NodeHealthChecker{
+			health:   make(map[string]NodeHealth),
+			interval: 5 * time.Minute,
+			timeout:  3 * time.Second,
+		},
 	}
 	b.client.SetConnectResultHook(func(success bool) {
 		node := b.currentNodeSnapshot()
@@ -119,6 +145,13 @@ func (b *SDKBootstrap) LoadRuntimePolicyFile(path string) error {
 	b.networkSwitchProtectSec = p.NetworkSwitchProtectSec
 	b.highAvailabilityHeartbeatSec = p.HighAvailabilityHeartbeatSec
 	b.recentSuccessPriority = p.RecentSuccessPriority
+	// Update health checker config
+	if p.HealthCheckIntervalSec > 0 {
+		b.healthChecker.interval = time.Duration(p.HealthCheckIntervalSec) * time.Second
+	}
+	if p.HealthCheckTimeoutMs > 0 {
+		b.healthChecker.timeout = time.Duration(p.HealthCheckTimeoutMs) * time.Millisecond
+	}
 	b.mu.Unlock()
 	return nil
 }
@@ -147,6 +180,10 @@ func (b *SDKBootstrap) Init(secret string) error {
 		b.loadOrCreateDeviceUUIDLocked()
 	}
 	b.prepared, b.lastError, b.updatedAt = false, "", time.Now()
+	// Reset health checker on init
+	b.healthChecker.health = make(map[string]NodeHealth)
+	// Reset last success node on init
+	b.lastSuccessNode = ""
 	return nil
 }
 func (b *SDKBootstrap) Prepare() error {
@@ -252,6 +289,7 @@ func (b *SDKBootstrap) Start() error {
 	b.mu.Lock()
 	b.state.RecordResult(true)
 	b.startAutoRefreshLocked()
+	b.startHealthCheckLoop()
 	b.lastError, b.updatedAt = "", time.Now()
 	b.mu.Unlock()
 	return nil
@@ -260,11 +298,19 @@ func (b *SDKBootstrap) Stop() {
 	b.mu.Lock()
 	c := b.client
 	b.stopAutoRefreshLocked()
+	b.stopHealthCheckLoop()
 	b.mu.Unlock()
 	c.Stop()
 	b.mu.Lock()
 	b.updatedAt = time.Now()
 	b.mu.Unlock()
+}
+
+// ResetHealthChecker resets the health checker state.
+func (b *SDKBootstrap) ResetHealthChecker() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.healthChecker.health = make(map[string]NodeHealth)
 }
 func (b *SDKBootstrap) LocalPort() int {
 	b.mu.Lock()
@@ -336,6 +382,12 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 	if b.state.CanTransition() {
 		b.state.RecordResult(success)
 	}
+	
+	// Lazy health check on failure
+	if !success && node == b.currentNode {
+		go b.lazyCheckCandidates()
+	}
+	
 	b.updatedAt = time.Now()
 }
 func (b *SDKBootstrap) CanTryNode(node string) bool {
@@ -733,6 +785,9 @@ func (b *SDKBootstrap) refreshControlPlaneOnce() {
 	if highAvailabilityHeartbeatSec > 0 && len(groups.E) > 0 {
 		go b.checkHighAvailabilityNodes(groups.E, highAvailabilityHeartbeatSec)
 	}
+
+	// Active switch: check if there's a better node
+	b.checkAndSwitchToBetterNode()
 }
 
 // checkHighAvailabilityNodes periodically probes high availability nodes (nodesE).
@@ -750,4 +805,237 @@ func (b *SDKBootstrap) checkHighAvailabilityNodes(nodes []string, intervalSec in
 	if err == nil {
 		conn.Close()
 	}
+}
+
+// startHealthCheckLoop starts the background health check goroutine.
+func (b *SDKBootstrap) startHealthCheckLoop() {
+	if b.healthChecker.running {
+		return
+	}
+	stop := make(chan struct{})
+	b.healthChecker.stop = stop
+	b.healthChecker.running = true
+	go b.healthCheckLoop(stop, b.healthChecker.interval)
+}
+
+// stopHealthCheckLoop stops the background health check goroutine.
+func (b *SDKBootstrap) stopHealthCheckLoop() {
+	if !b.healthChecker.running {
+		return
+	}
+	close(b.healthChecker.stop)
+	b.healthChecker.stop = nil
+	b.healthChecker.running = false
+}
+
+// healthCheckLoop runs periodic health checks.
+func (b *SDKBootstrap) healthCheckLoop(stop <-chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			b.checkAllNodesHealth()
+		}
+	}
+}
+
+// checkAllNodesHealth checks health of all nodes concurrently.
+func (b *SDKBootstrap) checkAllNodesHealth() {
+	b.mu.Lock()
+	if !b.prepared {
+		b.mu.Unlock()
+		return
+	}
+	// Get all nodes from fixed set and candidates
+	allNodes := b.getAllNodesLocked()
+	timeout := b.healthChecker.timeout
+	b.mu.Unlock()
+
+	if len(allNodes) == 0 {
+		return
+	}
+
+	// Concurrently check all nodes
+	healthy := b.concurrentCheck(allNodes, timeout)
+
+	// Update health status
+	b.mu.Lock()
+	for _, h := range healthy {
+		b.healthChecker.health[h.Node] = h
+	}
+	b.mu.Unlock()
+}
+
+// getAllNodesLocked returns all nodes from fixed set and candidates.
+func (b *SDKBootstrap) getAllNodesLocked() []string {
+	nodes := make(map[string]bool)
+	
+	// Add nodes from fixed set
+	for _, n := range b.fixedSet.AsList() {
+		nodes[n] = true
+	}
+	
+	// Add candidates
+	for _, n := range b.candidates {
+		nodes[n] = true
+	}
+	
+	// Convert to slice
+	result := make([]string, 0, len(nodes))
+	for n := range nodes {
+		result = append(result, n)
+	}
+	return result
+}
+
+// concurrentCheck checks multiple nodes concurrently.
+func (b *SDKBootstrap) concurrentCheck(nodes []string, timeout time.Duration) []NodeHealth {
+	if len(nodes) == 0 {
+		return nil
+	}
+	
+	results := make(chan NodeHealth, len(nodes))
+	
+	for _, node := range nodes {
+		go func(n string) {
+			health := b.checkSingleNode(n, timeout)
+			results <- health
+		}(node)
+	}
+	
+	var healthy []NodeHealth
+	for i := 0; i < len(nodes); i++ {
+		select {
+		case health := <-results:
+			healthy = append(healthy, health)
+		case <-time.After(timeout):
+			return healthy
+		}
+	}
+	return healthy
+}
+
+// checkSingleNode checks a single node's health.
+func (b *SDKBootstrap) checkSingleNode(node string, timeout time.Duration) NodeHealth {
+	host, port, err := parseEndpoint(node)
+	if err != nil {
+		return NodeHealth{Node: node, Healthy: false, LastCheck: time.Now()}
+	}
+	
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
+	rtt := time.Since(start)
+	
+	if err != nil {
+		return NodeHealth{Node: node, Healthy: false, LastCheck: time.Now(), RTT: rtt}
+	}
+	conn.Close()
+	
+	return NodeHealth{Node: node, Healthy: true, LastCheck: time.Now(), RTT: rtt}
+}
+
+// getBestNode returns the best node based on health status.
+func (b *SDKBootstrap) getBestNode() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	
+	if len(b.healthChecker.health) == 0 {
+		return ""
+	}
+	
+	var bestNode string
+	var bestScore float64 = -1
+	
+	for node, health := range b.healthChecker.health {
+		if !health.Healthy {
+			continue
+		}
+		
+		// Score: healthy + RTT bonus
+		score := 1.0 - (float64(health.RTT) / 10000.0) // RTT up to 10 seconds
+		if score > bestScore {
+			bestScore = score
+			bestNode = node
+		}
+	}
+	
+	return bestNode
+}
+
+// updateNodeHealth updates the health status of a node.
+func (b *SDKBootstrap) updateNodeHealth(health NodeHealth) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.healthChecker.health[health.Node] = health
+}
+
+// getHealth returns the health status of a node.
+func (b *SDKBootstrap) getHealth(node string) NodeHealth {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if h, ok := b.healthChecker.health[node]; ok {
+		return h
+	}
+	return NodeHealth{Node: node, Healthy: false}
+}
+
+// checkAndSwitchToBetterNode checks if there's a better node and switches if needed.
+func (b *SDKBootstrap) checkAndSwitchToBetterNode() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	
+	if !b.prepared || len(b.candidates) == 0 {
+		return
+	}
+	
+	// Get best node from health check
+	var bestNode string
+	var bestScore float64 = -1
+	
+	for _, node := range b.candidates {
+		if h, ok := b.healthChecker.health[node]; ok && h.Healthy {
+			score := 1.0 - (float64(h.RTT) / 10000.0)
+			if score > bestScore {
+				bestScore = score
+				bestNode = node
+			}
+		}
+	}
+	
+	// If best node is different from current and not in breaker, switch
+	if bestNode != "" && bestNode != b.currentNode && b.breaker.Allow(bestNode, time.Now()) {
+		host, port, err := parseEndpoint(bestNode)
+		if err == nil {
+			b.client.config.ServerHost = host
+			b.client.config.ServerPort = port
+			b.currentNode = bestNode
+			b.candidates = StableFallbackOrder(b.deviceUUID, b.fixedSet, b.currentNode)
+			b.lastFallbackReason = "health_check_switch"
+		}
+	}
+}
+
+// lazyCheckCandidates performs lazy health check on candidates after failure.
+func (b *SDKBootstrap) lazyCheckCandidates() {
+	b.mu.Lock()
+	if len(b.candidates) == 0 {
+		b.mu.Unlock()
+		return
+	}
+	candidates := b.candidates
+	timeout := b.healthChecker.timeout
+	b.mu.Unlock()
+
+	// Check candidates concurrently
+	healthy := b.concurrentCheck(candidates, timeout)
+
+	// Update health status
+	b.mu.Lock()
+	for _, h := range healthy {
+		b.healthChecker.health[h.Node] = h
+	}
+	b.mu.Unlock()
 }
