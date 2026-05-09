@@ -6,12 +6,19 @@
     "AttackToRecoverSuccess": 5,
     "RecoverToAttackFail": 2,
     "RecoverToNormalSuccess": 5,
-    "EmergencyToRecoverSuccess": 2
+    "EmergencyToRecoverSuccess": 2,
+    "state_min_dwell_sec": 5
   },
   "circuit_breaker": {
     "max_failures": 3,
     "base_backoff_ms": 1000,
-    "max_backoff_ms": 60000
-  }
+    "max_backoff_ms": 60000,
+    "half_open_probe_max_sec": 15
+  },
+  "dns_refresh_short_sec": 25,
+  "dns_refresh_long_sec": 90,
+  "dns_persist_failures": 3,
+  "network_switch_protect_sec": 8,
+  "high_availability_heartbeat_sec": 60,
+  "recent_success_priority": true
 }
-

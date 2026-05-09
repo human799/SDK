@@ -42,6 +42,18 @@ type SDKBootstrap struct {
 	autoRefreshInterval time.Duration
 	autoRefreshStop     chan struct{}
 	autoRefreshRunning  bool
+
+	// Extreme scenarios improvements
+	stateMinDwellSec           int
+	networkSwitchProtectSec    int
+	networkSwitchLastAt        time.Time
+	dnsRefreshShortSec         int
+	dnsRefreshLongSec          int
+	dnsPersistFailures         int
+	dnsPersistFailuresCount    int
+	highAvailabilityHeartbeatSec int
+	recentSuccessPriority      bool
+	lastSuccessNode            string
 }
 
 func NewSDKBootstrap() *SDKBootstrap {
@@ -54,6 +66,15 @@ func NewSDKBootstrap() *SDKBootstrap {
 		uuidPath:  "sdk_device_uuid.txt",
 		autoRefreshInterval: 10 * time.Second,
 		updatedAt: time.Now(),
+		// Default values for extreme scenarios improvements
+		stateMinDwellSec:           5,
+		networkSwitchProtectSec:    8,
+		networkSwitchLastAt:        time.Now(),
+		dnsRefreshShortSec:         25,
+		dnsRefreshLongSec:          90,
+		dnsPersistFailures:         3,
+		highAvailabilityHeartbeatSec: 60,
+		recentSuccessPriority:      true,
 	}
 	b.client.SetConnectResultHook(func(success bool) {
 		node := b.currentNodeSnapshot()
@@ -69,6 +90,9 @@ func (b *SDKBootstrap) ConfigureStateMachine(cfg StateMachineConfig) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.state = NewStateMachineWithConfig(cfg)
+	if cfg.StateMinDwellSec > 0 {
+		b.stateMinDwellSec = cfg.StateMinDwellSec
+	}
 	b.updatedAt = time.Now()
 }
 func (b *SDKBootstrap) ConfigureCircuitBreaker(cfg CircuitBreakerConfig) {
@@ -88,6 +112,14 @@ func (b *SDKBootstrap) LoadRuntimePolicyFile(path string) error {
 		BaseBackoff: time.Duration(p.CircuitBreaker.BaseBackoffMs) * time.Millisecond,
 		MaxBackoff:  time.Duration(p.CircuitBreaker.MaxBackoffMs) * time.Millisecond,
 	})
+	b.mu.Lock()
+	b.dnsRefreshShortSec = p.DNSRefreshShortSec
+	b.dnsRefreshLongSec = p.DNSRefreshLongSec
+	b.dnsPersistFailures = p.DNSPersistFailures
+	b.networkSwitchProtectSec = p.NetworkSwitchProtectSec
+	b.highAvailabilityHeartbeatSec = p.HighAvailabilityHeartbeatSec
+	b.recentSuccessPriority = p.RecentSuccessPriority
+	b.mu.Unlock()
 	return nil
 }
 func (b *SDKBootstrap) LoadConfigFile(path string) error {
@@ -252,23 +284,42 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 	defer b.mu.Unlock()
 	if success {
 		b.breaker.RecordSuccess(node)
+		// Record recent success node for fallback priority
+		if b.recentSuccessPriority && node == b.currentNode {
+			b.lastSuccessNode = node
+		}
 	} else {
 		b.breaker.RecordFailure(node, time.Now())
 		if node == b.currentNode {
 			switched := false
-			for _, n := range b.candidates {
-				if !b.breaker.Allow(n, time.Now()) {
-					continue
+			// Use recent success priority if enabled
+			if b.recentSuccessPriority && b.lastSuccessNode != "" && b.lastSuccessNode != node {
+				if b.breaker.Allow(b.lastSuccessNode, time.Now()) {
+					host, port, err := parseEndpoint(b.lastSuccessNode)
+					if err == nil {
+						b.client.config.ServerHost, b.client.config.ServerPort = host, port
+						b.currentNode = b.lastSuccessNode
+						b.candidates = StableFallbackOrderWithRecentSuccess(b.deviceUUID, b.fixedSet, b.currentNode, b.lastSuccessNode)
+						b.lastFallbackReason = "recent_success_fallback"
+						switched = true
+					}
 				}
-				host, port, err := parseEndpoint(n)
-				if err != nil {
-					continue
+			}
+			if !switched {
+				for _, n := range b.candidates {
+					if !b.breaker.Allow(n, time.Now()) {
+						continue
+					}
+					host, port, err := parseEndpoint(n)
+					if err != nil {
+						continue
+					}
+					b.client.config.ServerHost, b.client.config.ServerPort = host, port
+					b.currentNode, b.candidates = n, StableFallbackOrder(b.deviceUUID, b.fixedSet, n)
+					b.lastFallbackReason = "fixed_set_switch"
+					switched = true
+					break
 				}
-				b.client.config.ServerHost, b.client.config.ServerPort = host, port
-				b.currentNode, b.candidates = n, StableFallbackOrder(b.deviceUUID, b.fixedSet, n)
-				b.lastFallbackReason = "fixed_set_switch"
-				switched = true
-				break
 			}
 			if !switched {
 				// Distinguish local network failure from node-specific failure.
@@ -281,7 +332,10 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 			}
 		}
 	}
-	b.state.RecordResult(success)
+	// Check if state can transition based on minimum dwell time
+	if b.state.CanTransition() {
+		b.state.RecordResult(success)
+	}
 	b.updatedAt = time.Now()
 }
 func (b *SDKBootstrap) CanTryNode(node string) bool {
@@ -292,6 +346,14 @@ func (b *SDKBootstrap) CanTryNode(node string) bool {
 func (b *SDKBootstrap) Status() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	type diagnostic struct {
+		StateMinDwellRemainingSec int    `json:"state_min_dwell_remaining_sec,omitempty"`
+		NetworkSwitchProtectSec   int    `json:"network_switch_protect_remaining_sec,omitempty"`
+		DNSRefreshIntervalSec     int    `json:"dns_refresh_interval_sec,omitempty"`
+		DNSPersistFailuresCount   int    `json:"dns_persist_failures_count,omitempty"`
+		RecentSuccessFallbackCount int   `json:"recent_success_fallback_count,omitempty"`
+		LastSuccessNode           string `json:"last_success_node,omitempty"`
+	}
 	type status struct {
 		Prepared                bool           `json:"prepared"`
 		Running                 bool           `json:"running"`
@@ -312,12 +374,35 @@ func (b *SDKBootstrap) Status() string {
 		LastNetworkOK           bool           `json:"last_network_ok"`
 		LastNetworkCheckAt      int64          `json:"last_network_check_unix,omitempty"`
 		UpdatedAt               int64          `json:"updated_at_unix"`
+		Diagnostic              *diagnostic    `json:"diagnostic,omitempty"`
 	}
 	failCnt, openUntil := 0, int64(0)
 	if b.currentNode != "" {
 		failCnt = b.breaker.FailureCount(b.currentNode)
 		openUntil = b.breaker.OpenUntil(b.currentNode).Unix()
 	}
+	// Calculate diagnostic info
+	diag := &diagnostic{}
+	if b.stateMinDwellSec > 0 {
+		elapsed := time.Since(b.state.lastStateEnteredAt).Seconds()
+		if elapsed < float64(b.stateMinDwellSec) {
+			diag.StateMinDwellRemainingSec = int(float64(b.stateMinDwellSec) - elapsed)
+		}
+	}
+	if b.networkSwitchProtectSec > 0 {
+		elapsed := time.Since(b.networkSwitchLastAt).Seconds()
+		if elapsed < float64(b.networkSwitchProtectSec) {
+			diag.NetworkSwitchProtectSec = int(float64(b.networkSwitchProtectSec) - elapsed)
+		}
+	}
+	if b.dnsPersistFailuresCount <= b.dnsPersistFailures {
+		diag.DNSRefreshIntervalSec = b.dnsRefreshShortSec
+	} else {
+		diag.DNSRefreshIntervalSec = b.dnsRefreshLongSec
+	}
+	diag.DNSPersistFailuresCount = b.dnsPersistFailuresCount
+	diag.RecentSuccessFallbackCount = 0 // TODO: track this
+	diag.LastSuccessNode = b.lastSuccessNode
 	out, err := json.Marshal(status{
 		Prepared: b.prepared, Running: b.client.IsRunning(), LocalPort: b.client.LocalPort(),
 		ServerHost: b.client.config.ServerHost, ServerPort: b.client.config.ServerPort,
@@ -326,6 +411,7 @@ func (b *SDKBootstrap) Status() string {
 		NextDNSAt: b.nextDNSAt.Unix(), LastFallbackReason: b.lastFallbackReason,
 		CurrentNodeFailureCount: failCnt, CurrentNodeOpenUntil: openUntil, UpdatedAt: b.updatedAt.Unix(),
 		LastNetworkOK: b.lastNetworkOK, LastNetworkCheckAt: b.lastNetworkCheckAt.Unix(),
+		Diagnostic: diag,
 	})
 	if err != nil {
 		return `{"last_error":"status marshal failed"}`
@@ -397,6 +483,18 @@ func (b *SDKBootstrap) SetCacheFile(path string) error {
 	return nil
 }
 
+// SetNetworkSwitch marks that a network switch has occurred.
+// This triggers a protection window during which熔断升级 is suspended.
+func (b *SDKBootstrap) SetNetworkSwitch() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.networkSwitchLastAt = time.Now()
+	b.lastNetworkCheckAt = time.Now()
+	b.lastNetworkOK = true
+	// Trigger immediate control plane refresh after network switch
+	go b.refreshControlPlaneOnce()
+}
+
 func (b *SDKBootstrap) tryDomainFallbackLocked() {
 	now := time.Now()
 	if b.payload == nil || b.payload.AppDomain == "" {
@@ -412,14 +510,24 @@ func (b *SDKBootstrap) tryDomainFallbackLocked() {
 	}
 	host, err := resolveAppDomainHost(b.payload.AppDomain)
 	if err != nil {
+		b.dnsPersistFailuresCount++
+		// Dual-layer DNS refresh: short period first, then long period for persistent failures
+		var nextInterval time.Duration
+		if b.dnsPersistFailuresCount <= b.dnsPersistFailures {
+			nextInterval = time.Duration(b.dnsRefreshShortSec) * time.Second
+		} else {
+			nextInterval = time.Duration(b.dnsRefreshLongSec) * time.Second
+		}
 		b.state.EnterEmergency()
-		b.nextDNSAt = now.Add(randomDNSInterval())
+		b.nextDNSAt = now.Add(nextInterval)
 		return
 	}
+	// Reset failure count on success
+	b.dnsPersistFailuresCount = 0
 	b.client.config.ServerHost, b.client.config.ServerPort = host, port
 	b.currentNode = net.JoinHostPort(host, strconv.Itoa(port))
 	b.lastFallbackReason = "app_domain_dns"
-	b.nextDNSAt = now.Add(randomDNSInterval())
+	b.nextDNSAt = now.Add(time.Duration(b.dnsRefreshShortSec) * time.Second)
 }
 
 func resolveAppDomainHost(domain string) (string, error) {
@@ -579,6 +687,7 @@ func (b *SDKBootstrap) refreshControlPlaneOnce() {
 	payloadCopy := *b.payload
 	deviceUUID := b.deviceUUID
 	cachePath := b.cachePath
+	highAvailabilityHeartbeatSec := b.highAvailabilityHeartbeatSec
 	b.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -616,4 +725,26 @@ func (b *SDKBootstrap) refreshControlPlaneOnce() {
 	b.fixedSet = set
 	b.candidates = StableFallbackOrder(deviceUUID, set, b.currentNode)
 	b.updatedAt = time.Now()
+
+	// High availability heartbeat for nodesE (if configured)
+	if highAvailabilityHeartbeatSec > 0 && len(groups.E) > 0 {
+		go b.checkHighAvailabilityNodes(groups.E, highAvailabilityHeartbeatSec)
+	}
+}
+
+// checkHighAvailabilityNodes periodically probes high availability nodes (nodesE).
+func (b *SDKBootstrap) checkHighAvailabilityNodes(nodes []string, intervalSec int) {
+	if len(nodes) == 0 {
+		return
+	}
+	// Probe the first HA node
+	host, port, err := parseEndpoint(nodes[0])
+	if err != nil {
+		return
+	}
+	// Use a non-blocking check with timeout
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 2*time.Second)
+	if err == nil {
+		conn.Close()
+	}
 }

@@ -25,19 +25,21 @@ type StateMachineConfig struct {
 	RecoverToAttackFail       int
 	RecoverToNormalSuccess    int
 	EmergencyToRecoverSuccess int
+	StateMinDwellSec          int
 }
 
 type StateMachine struct {
-	mu              sync.Mutex
-	state           SDKState
-	consecFailures  int
-	consecSuccesses int
-	lastChangedAt   time.Time
-	cfg             StateMachineConfig
+	mu                 sync.Mutex
+	state              SDKState
+	consecFailures     int
+	consecSuccesses    int
+	lastChangedAt      time.Time
+	lastStateEnteredAt time.Time
+	cfg                StateMachineConfig
 }
 
 func defaultStateMachineConfig() StateMachineConfig {
-	return StateMachineConfig{2, 4, 3, 5, 2, 5, 2}
+	return StateMachineConfig{2, 4, 3, 5, 2, 5, 2, 5}
 }
 
 func normalizeStateMachineConfig(cfg *StateMachineConfig) {
@@ -63,12 +65,15 @@ func normalizeStateMachineConfig(cfg *StateMachineConfig) {
 	if cfg.EmergencyToRecoverSuccess <= 0 {
 		cfg.EmergencyToRecoverSuccess = def.EmergencyToRecoverSuccess
 	}
+	if cfg.StateMinDwellSec <= 0 {
+		cfg.StateMinDwellSec = 5
+	}
 }
 
 func NewStateMachine() *StateMachine { return NewStateMachineWithConfig(defaultStateMachineConfig()) }
 func NewStateMachineWithConfig(cfg StateMachineConfig) *StateMachine {
 	normalizeStateMachineConfig(&cfg)
-	return &StateMachine{state: StateNormal, lastChangedAt: time.Now(), cfg: cfg}
+	return &StateMachine{state: StateNormal, lastChangedAt: time.Now(), lastStateEnteredAt: time.Now(), cfg: cfg}
 }
 
 func (s *StateMachine) State() SDKState {
@@ -116,6 +121,7 @@ func (s *StateMachine) RecordResult(success bool) SDKState {
 	}
 	if prev != s.state {
 		s.lastChangedAt = time.Now()
+		s.lastStateEnteredAt = time.Now()
 	}
 	return s.state
 }
@@ -126,12 +132,24 @@ func (s *StateMachine) EnterEmergency() {
 	s.state = StateEmergency
 	s.consecFailures, s.consecSuccesses = 0, 0
 	s.lastChangedAt = time.Now()
+	s.lastStateEnteredAt = time.Now()
+}
+
+// CanTransition checks if the state can transition based on minimum dwell time.
+func (s *StateMachine) CanTransition() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.StateMinDwellSec <= 0 {
+		return true
+	}
+	return time.Since(s.lastStateEnteredAt) >= time.Duration(s.cfg.StateMinDwellSec)*time.Second
 }
 
 type CircuitBreakerConfig struct {
-	MaxFailures int
-	BaseBackoff time.Duration
-	MaxBackoff  time.Duration
+	MaxFailures         int
+	BaseBackoff         time.Duration
+	MaxBackoff          time.Duration
+	HalfOpenProbeMaxSec int
 }
 type CircuitBreaker struct {
 	mu          sync.Mutex
@@ -143,7 +161,7 @@ type CircuitBreaker struct {
 }
 
 func defaultCircuitBreakerConfig() CircuitBreakerConfig {
-	return CircuitBreakerConfig{MaxFailures: 3, BaseBackoff: time.Second, MaxBackoff: 60 * time.Second}
+	return CircuitBreakerConfig{MaxFailures: 3, BaseBackoff: time.Second, MaxBackoff: 60 * time.Second, HalfOpenProbeMaxSec: 15}
 }
 func NewCircuitBreaker() *CircuitBreaker { return NewCircuitBreakerWithConfig(defaultCircuitBreakerConfig()) }
 func NewCircuitBreakerWithConfig(cfg CircuitBreakerConfig) *CircuitBreaker {
@@ -156,6 +174,9 @@ func NewCircuitBreakerWithConfig(cfg CircuitBreakerConfig) *CircuitBreaker {
 	}
 	if cfg.MaxBackoff < cfg.BaseBackoff {
 		cfg.MaxBackoff = def.MaxBackoff
+	}
+	if cfg.HalfOpenProbeMaxSec <= 0 {
+		cfg.HalfOpenProbeMaxSec = def.HalfOpenProbeMaxSec
 	}
 	return &CircuitBreaker{
 		failures:    map[string]int{},

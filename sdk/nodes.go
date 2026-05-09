@@ -63,6 +63,35 @@ func StableFallbackOrder(uuid string, set FixedNodeSet, current string) []string
 	return out
 }
 
+// StableFallbackOrderWithRecentSuccess returns fallback order with recent success node first.
+func StableFallbackOrderWithRecentSuccess(uuid string, set FixedNodeSet, current string, recentSuccess string) []string {
+	nodes := set.AsList()
+	type rank struct {
+		node       string
+		v          uint64
+		isRecent   bool
+	}
+	arr := make([]rank, 0, len(nodes))
+	for _, n := range nodes {
+		if n == current {
+			continue
+		}
+		isRecent := n == recentSuccess
+		arr = append(arr, rank{node: n, v: hash64(fmt.Sprintf("%s|fallback|%s", uuid, n)), isRecent: isRecent})
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		if arr[i].isRecent != arr[j].isRecent {
+			return arr[i].isRecent // recent success first
+		}
+		return arr[i].v < arr[j].v
+	})
+	out := make([]string, 0, len(arr))
+	for _, it := range arr {
+		out = append(out, it.node)
+	}
+	return out
+}
+
 func pickByUUID(uuid, partition string, nodes []string) string {
 	if len(nodes) == 0 {
 		return ""
