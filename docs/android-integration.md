@@ -33,7 +33,7 @@ dependencies {
 
 ```kotlin
 val b = Sdk.newSDKBootstrap()
-b.setDataDir(filesDir.absolutePath) // 推荐：让 UUID/缓存自动持久化
+// setDataDir 可选：不传则由 SDK 在 Init 时自动选择应用沙箱内的持久目录
 b.init(secret)
 b.prepare()
 b.setLocalPort(0) // 随机端口
@@ -46,7 +46,6 @@ val status = b.status()
 
 ```java
 SDKBootstrap b = Sdk.newSDKBootstrap();
-b.setDataDir(getFilesDir().getAbsolutePath()); // 推荐
 b.init(secret);
 b.prepare();
 b.setLocalPort(0);
@@ -66,5 +65,5 @@ b.stop();
 - 生产环境建议设置持久化 `UUID`：`setDeviceUUID(...)`
 - 建议设置缓存路径：`setCacheFile(...)`
 - 如需策略调参：`loadRuntimePolicyFile(...)`
-- 推荐先调用 `setDataDir(...)`，SDK 会自动持久化 `deviceUUID` 与缓存文件
+- 可选调用 `setDataDir(...)` 自定义目录；否则 `init` 会按候选目录逐个创建（失败则回退到进程目录下的 `sdk_cache.json`，与旧版一致）
 

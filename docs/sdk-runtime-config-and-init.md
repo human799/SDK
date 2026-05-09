@@ -3,12 +3,12 @@
 ## 最小流程
 
 1. `b := sdk.NewSDKBootstrap()`
-2. `b.SetDataDir(appDataDir)`（推荐，自动持久化 UUID+缓存）
-2. `b.init(secret)`
-3. `b.prepare()`
-4. `b.setLocalPort(0)`
-5. `b.start()`
-6. `port := b.localPort()`
+2. `b.SetDataDir(appDataDir)`（可选；省略则由 `Init` 自动选择本机用户配置目录 / Android 沙箱路径）
+3. `b.init(secret)`
+4. `b.prepare()`
+5. `b.setLocalPort(0)`
+6. `b.start()`
+7. `port := b.localPort()`
 
 ## 可选初始化
 

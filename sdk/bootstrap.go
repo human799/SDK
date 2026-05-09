@@ -74,6 +74,11 @@ type SDKBootstrap struct {
 
     // Node health checker
     healthChecker *NodeHealthChecker
+
+	// explicitDataDir: SetDataDir was called; skip automatic persistence root.
+	explicitDataDir bool
+	// cachePathExplicit: SetCacheFile was called; keep cache path, derive uuid dir from it unless explicitDataDir is set.
+	cachePathExplicit bool
 }
 
 func NewSDKBootstrap() *SDKBootstrap {
@@ -168,6 +173,9 @@ func (b *SDKBootstrap) LoadConfigFile(path string) error {
 func (b *SDKBootstrap) Init(secret string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if err := b.applyAutoDataDirLocked(); err != nil {
+		return b.failLocked(fmt.Sprintf("sdk data dir: %v", err))
+	}
 	if secret == "" {
 		return b.failLocked("empty secret")
 	}
@@ -474,6 +482,9 @@ func (b *SDKBootstrap) Status() string {
 func (b *SDKBootstrap) SetDeviceUUID(uuid string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if err := b.applyAutoDataDirLocked(); err != nil {
+		return b.failLocked(fmt.Sprintf("sdk data dir: %v", err))
+	}
 	if uuid == "" {
 		return b.failLocked("empty device uuid")
 	}
@@ -502,8 +513,41 @@ func (b *SDKBootstrap) SetAutoRefreshIntervalSec(sec int) {
 	b.updatedAt = time.Now()
 }
 
+// applyAutoDataDirLocked chooses a persistent directory when the app did not call SetDataDir.
+func (b *SDKBootstrap) applyAutoDataDirLocked() error {
+	if b.explicitDataDir {
+		return nil
+	}
+	if b.cachePathExplicit {
+		dir := filepath.Dir(b.cachePath)
+		if dir == "" {
+			dir = "."
+		}
+		b.dataDir = dir
+		b.uuidPath = filepath.Join(dir, "sdk_device_uuid.txt")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		return nil
+	}
+	for _, dir := range autoSDKDataDirCandidates() {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			continue
+		}
+		b.dataDir = dir
+		b.cachePath = filepath.Join(dir, "sdk_cache.json")
+		b.uuidPath = filepath.Join(dir, "sdk_device_uuid.txt")
+		return nil
+	}
+	// Same layout as pre–auto-datadir SDK: cwd files (always mkdir-able).
+	b.dataDir = "."
+	b.cachePath = "sdk_cache.json"
+	b.uuidPath = "sdk_device_uuid.txt"
+	return nil
+}
+
 // SetDataDir sets cross-platform SDK data directory for cache/uuid files.
-// Android/iOS should pass app private files directory; Windows can pass app data dir.
+// Optional: if never called, Init applies a default (app config dir / Android sandbox).
 func (b *SDKBootstrap) SetDataDir(path string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -511,6 +555,8 @@ func (b *SDKBootstrap) SetDataDir(path string) error {
 	if p == "" {
 		return b.failLocked("empty data dir")
 	}
+	b.explicitDataDir = true
+	b.cachePathExplicit = false
 	b.dataDir = p
 	b.cachePath = filepath.Join(p, "sdk_cache.json")
 	b.uuidPath = filepath.Join(p, "sdk_device_uuid.txt")
@@ -530,6 +576,7 @@ func (b *SDKBootstrap) SetCacheFile(path string) error {
 	if strings.TrimSpace(path) == "" {
 		return b.failLocked("empty cache file path")
 	}
+	b.cachePathExplicit = true
 	b.cachePath = path
 	b.updatedAt = time.Now()
 	return nil
