@@ -528,6 +528,9 @@ func (b *SDKBootstrap) tryDomainFallbackLocked() {
 	b.currentNode = net.JoinHostPort(host, strconv.Itoa(port))
 	b.lastFallbackReason = "app_domain_dns"
 	b.nextDNSAt = now.Add(time.Duration(b.dnsRefreshShortSec) * time.Second)
+	// Immediately try to refresh control plane after domain fallback
+	// This allows faster recovery when control plane is back online
+	go b.refreshControlPlaneOnce()
 }
 
 func resolveAppDomainHost(domain string) (string, error) {
