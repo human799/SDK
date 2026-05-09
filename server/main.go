@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	listenAddr := flag.String("listen", "0.0.0.0:10443", "监听地址 host:port")
+	listenAddr := flag.String("listen", "0.0.0.0:443", "监听地址 host:port")
 	targetAddr := flag.String("target", "52.128.229.186:10443", "源站地址 host:port")
 	certFile := flag.String("cert", "", "TLS 证书 PEM 路径（留空则明文）")
 	keyFile := flag.String("key", "", "TLS 私钥 PEM 路径")

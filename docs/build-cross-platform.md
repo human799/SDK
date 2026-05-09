@@ -5,6 +5,7 @@
 - Android（Windows/Git Bash）：`scripts/build-android-aar.sh`
 - Android（PowerShell）：`scripts/build-aar-with-local-key.ps1`
 - iOS（macOS）：`scripts/build-ios-xcframework.sh`
+- iOS（macOS，内置私钥）：`scripts/build-ios-xcframework-with-local-key.sh`
 
 ---
 
@@ -43,6 +44,19 @@ chmod +x ./scripts/build-ios-xcframework.sh
 
 ```bash
 ./scripts/build-ios-xcframework.sh sdk-ios.xcframework
+```
+
+### iOS（macOS，内置本地私钥）
+
+```bash
+chmod +x ./scripts/build-ios-xcframework-with-local-key.sh
+./scripts/build-ios-xcframework-with-local-key.sh
+```
+
+可选参数：
+
+```bash
+./scripts/build-ios-xcframework-with-local-key.sh ./config-templates/private_key.pem sdk-ios.xcframework
 ```
 
 ---

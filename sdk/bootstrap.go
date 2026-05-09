@@ -62,12 +62,14 @@ func NewSDKBootstrap() *SDKBootstrap {
 }
 
 func (b *SDKBootstrap) ConfigureStateMachine(cfg StateMachineConfig) {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.state = NewStateMachineWithConfig(cfg)
 	b.updatedAt = time.Now()
 }
 func (b *SDKBootstrap) ConfigureCircuitBreaker(cfg CircuitBreakerConfig) {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.breaker = NewCircuitBreakerWithConfig(cfg)
 	b.updatedAt = time.Now()
 }
@@ -85,7 +87,8 @@ func (b *SDKBootstrap) LoadRuntimePolicyFile(path string) error {
 	return nil
 }
 func (b *SDKBootstrap) LoadConfigFile(path string) error {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := LoadEmbeddedPrivateKeyFromConfigFile(path); err != nil {
 		return b.failLocked(fmt.Sprintf("load config file failed: %v", err))
 	}
@@ -94,7 +97,8 @@ func (b *SDKBootstrap) LoadConfigFile(path string) error {
 	return nil
 }
 func (b *SDKBootstrap) Init(secret string) error {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if secret == "" {
 		return b.failLocked("empty secret")
 	}
@@ -133,7 +137,7 @@ func (b *SDKBootstrap) Prepare() error {
 		if payloadCopy.AppDomain != "" {
 			host, derr := resolveAppDomainHost(payloadCopy.AppDomain)
 			if derr == nil {
-				port := 10443
+				port := 443
 				b.mu.Lock()
 				b.client.config.ServerHost = host
 				b.client.config.ServerPort = port
@@ -178,7 +182,8 @@ func (b *SDKBootstrap) Prepare() error {
 }
 
 func (b *SDKBootstrap) SetServerEndpoint(host string, port int) error {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if host == "" || port <= 0 {
 		return b.failLocked("invalid server endpoint")
 	}
@@ -187,7 +192,8 @@ func (b *SDKBootstrap) SetServerEndpoint(host string, port int) error {
 	return nil
 }
 func (b *SDKBootstrap) SetLocalPort(port int) error {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if port < 0 || port > 65535 {
 		return b.failLocked("invalid local port")
 	}
@@ -213,18 +219,31 @@ func (b *SDKBootstrap) Start() error {
 	b.mu.Unlock()
 	return nil
 }
-func (b *SDKBootstrap) Stop() { b.mu.Lock(); c := b.client; b.mu.Unlock(); c.Stop(); b.mu.Lock(); b.updatedAt = time.Now(); b.mu.Unlock() }
+func (b *SDKBootstrap) Stop() {
+	b.mu.Lock()
+	c := b.client
+	b.mu.Unlock()
+	c.Stop()
+	b.mu.Lock()
+	b.updatedAt = time.Now()
+	b.mu.Unlock()
+}
 func (b *SDKBootstrap) LocalPort() int {
-	b.mu.Lock(); c := b.client; b.mu.Unlock()
+	b.mu.Lock()
+	c := b.client
+	b.mu.Unlock()
 	return c.LocalPort()
 }
 func (b *SDKBootstrap) IsRunning() bool {
-	b.mu.Lock(); c := b.client; b.mu.Unlock()
+	b.mu.Lock()
+	c := b.client
+	b.mu.Unlock()
 	return c.IsRunning()
 }
 
 func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if success {
 		b.breaker.RecordSuccess(node)
 	} else {
@@ -260,24 +279,33 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 	b.updatedAt = time.Now()
 }
 func (b *SDKBootstrap) CanTryNode(node string) bool {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.breaker.Allow(node, time.Now())
 }
 func (b *SDKBootstrap) Status() string {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	type status struct {
-		Prepared bool `json:"prepared"`; Running bool `json:"running"`; LocalPort int `json:"local_port"`
-		ServerHost string `json:"server_host"`; ServerPort int `json:"server_port"`
-		LastError string `json:"last_error,omitempty"`; Payload *SecretPayload `json:"payload,omitempty"`
-		State SDKState `json:"state"`; DeviceUUID string `json:"device_uuid,omitempty"`
-		FixedSet FixedNodeSet `json:"fixed_set"`; Current string `json:"current_node,omitempty"`
-		Candidates []string `json:"candidates,omitempty"`; NextDNSAt int64 `json:"next_dns_refresh_unix,omitempty"`
-		LastFallbackReason string `json:"last_fallback_reason,omitempty"`
-		CurrentNodeFailureCount int `json:"current_node_failures"`
-		CurrentNodeOpenUntil int64 `json:"current_node_open_until_unix,omitempty"`
-		LastNetworkOK bool `json:"last_network_ok"`
-		LastNetworkCheckAt int64 `json:"last_network_check_unix,omitempty"`
-		UpdatedAt int64 `json:"updated_at_unix"`
+		Prepared                bool           `json:"prepared"`
+		Running                 bool           `json:"running"`
+		LocalPort               int            `json:"local_port"`
+		ServerHost              string         `json:"server_host"`
+		ServerPort              int            `json:"server_port"`
+		LastError               string         `json:"last_error,omitempty"`
+		Payload                 *SecretPayload `json:"payload,omitempty"`
+		State                   SDKState       `json:"state"`
+		DeviceUUID              string         `json:"device_uuid,omitempty"`
+		FixedSet                FixedNodeSet   `json:"fixed_set"`
+		Current                 string         `json:"current_node,omitempty"`
+		Candidates              []string       `json:"candidates,omitempty"`
+		NextDNSAt               int64          `json:"next_dns_refresh_unix,omitempty"`
+		LastFallbackReason      string         `json:"last_fallback_reason,omitempty"`
+		CurrentNodeFailureCount int            `json:"current_node_failures"`
+		CurrentNodeOpenUntil    int64          `json:"current_node_open_until_unix,omitempty"`
+		LastNetworkOK           bool           `json:"last_network_ok"`
+		LastNetworkCheckAt      int64          `json:"last_network_check_unix,omitempty"`
+		UpdatedAt               int64          `json:"updated_at_unix"`
 	}
 	failCnt, openUntil := 0, int64(0)
 	if b.currentNode != "" {
@@ -300,7 +328,8 @@ func (b *SDKBootstrap) Status() string {
 }
 
 func (b *SDKBootstrap) SetDeviceUUID(uuid string) error {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if uuid == "" {
 		return b.failLocked("empty device uuid")
 	}
@@ -333,7 +362,8 @@ func (b *SDKBootstrap) DeviceUUID() string {
 	return b.deviceUUID
 }
 func (b *SDKBootstrap) SetCacheFile(path string) error {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if strings.TrimSpace(path) == "" {
 		return b.failLocked("empty cache file path")
 	}
@@ -381,7 +411,9 @@ func resolveAppDomainHost(domain string) (string, error) {
 	}
 	return ips[0], nil
 }
-func randomDNSInterval() time.Duration { return time.Duration(20+(time.Now().UnixNano()%11)) * time.Second }
+func randomDNSInterval() time.Duration {
+	return time.Duration(20+(time.Now().UnixNano()%11)) * time.Second
+}
 func randomLabel(n int) string {
 	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
 	if n <= 0 {
@@ -437,7 +469,11 @@ func parseEndpoint(endpoint string) (string, int, error) {
 	}
 	return host, port, nil
 }
-func (b *SDKBootstrap) fail(msg string) error { b.mu.Lock(); defer b.mu.Unlock(); return b.failLocked(msg) }
+func (b *SDKBootstrap) fail(msg string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.failLocked(msg)
+}
 func (b *SDKBootstrap) failLocked(msg string) error {
 	b.lastError = msg
 	b.updatedAt = time.Now()
@@ -475,4 +511,3 @@ func (b *SDKBootstrap) currentNodeSnapshot() string {
 	defer b.mu.Unlock()
 	return b.currentNode
 }
-
