@@ -50,7 +50,7 @@ openssl req -x509 -newkey rsa:2048 -nodes ^
 ### 启动
 
 ```cmd
-./proxy-server -listen 0.0.0.0:10443 -target 52.128.229.186:10443 -cert server.crt -key server.key```
+./proxy-server -listen 0.0.0.0:443 -target 52.128.229.186:10443 -cert server.crt -key server.key
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
@@ -173,7 +173,7 @@ gomobile bind -target=android/arm64,android/arm -androidapi 21 \
 
 启动
 nohup ./proxy-server \
--listen 0.0.0.0:10443 \
+-listen 0.0.0.0:443 \
 -target 52.128.229.186:10443 \
 -cert server.crt \
 -key server.key \

@@ -39,6 +39,9 @@ type SDKBootstrap struct {
 	prepared           bool
 	lastError          string
 	updatedAt          time.Time
+	autoRefreshInterval time.Duration
+	autoRefreshStop     chan struct{}
+	autoRefreshRunning  bool
 }
 
 func NewSDKBootstrap() *SDKBootstrap {
@@ -49,6 +52,7 @@ func NewSDKBootstrap() *SDKBootstrap {
 		cachePath: "sdk_cache.json",
 		dataDir:   ".",
 		uuidPath:  "sdk_device_uuid.txt",
+		autoRefreshInterval: 10 * time.Second,
 		updatedAt: time.Now(),
 	}
 	b.client.SetConnectResultHook(func(success bool) {
@@ -215,6 +219,7 @@ func (b *SDKBootstrap) Start() error {
 	}
 	b.mu.Lock()
 	b.state.RecordResult(true)
+	b.startAutoRefreshLocked()
 	b.lastError, b.updatedAt = "", time.Now()
 	b.mu.Unlock()
 	return nil
@@ -222,6 +227,7 @@ func (b *SDKBootstrap) Start() error {
 func (b *SDKBootstrap) Stop() {
 	b.mu.Lock()
 	c := b.client
+	b.stopAutoRefreshLocked()
 	b.mu.Unlock()
 	c.Stop()
 	b.mu.Lock()
@@ -337,6 +343,25 @@ func (b *SDKBootstrap) SetDeviceUUID(uuid string) error {
 	_ = b.persistDeviceUUIDLocked()
 	b.updatedAt = time.Now()
 	return nil
+}
+
+// SetAutoRefreshIntervalSec sets background refresh interval seconds.
+// sec <= 0 disables auto-refresh.
+func (b *SDKBootstrap) SetAutoRefreshIntervalSec(sec int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if sec <= 0 {
+		b.autoRefreshInterval = 0
+		b.stopAutoRefreshLocked()
+		b.updatedAt = time.Now()
+		return
+	}
+	b.autoRefreshInterval = time.Duration(sec) * time.Second
+	if b.autoRefreshRunning {
+		b.stopAutoRefreshLocked()
+		b.startAutoRefreshLocked()
+	}
+	b.updatedAt = time.Now()
 }
 
 // SetDataDir sets cross-platform SDK data directory for cache/uuid files.
@@ -510,4 +535,85 @@ func (b *SDKBootstrap) currentNodeSnapshot() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.currentNode
+}
+
+func (b *SDKBootstrap) startAutoRefreshLocked() {
+	if b.autoRefreshRunning || b.autoRefreshInterval <= 0 {
+		return
+	}
+	stop := make(chan struct{})
+	b.autoRefreshStop = stop
+	b.autoRefreshRunning = true
+	interval := b.autoRefreshInterval
+	go b.autoRefreshLoop(stop, interval)
+}
+
+func (b *SDKBootstrap) stopAutoRefreshLocked() {
+	if !b.autoRefreshRunning {
+		return
+	}
+	close(b.autoRefreshStop)
+	b.autoRefreshStop = nil
+	b.autoRefreshRunning = false
+}
+
+func (b *SDKBootstrap) autoRefreshLoop(stop <-chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			b.refreshControlPlaneOnce()
+		}
+	}
+}
+
+func (b *SDKBootstrap) refreshControlPlaneOnce() {
+	b.mu.Lock()
+	if b.payload == nil || !b.prepared {
+		b.mu.Unlock()
+		return
+	}
+	payloadCopy := *b.payload
+	deviceUUID := b.deviceUUID
+	cachePath := b.cachePath
+	b.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cacheData, _ := loadSDKCache(cachePath)
+	groups, updatedCache, err := resolveControlPlane(ctx, &payloadCopy, cacheData)
+	if err != nil {
+		return
+	}
+	_ = saveSDKCache(cachePath, updatedCache)
+	set := SelectFixedNodeSet(deviceUUID, groups)
+	nodes := set.AsList()
+	if len(nodes) == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cur := b.currentNode
+	inSet := false
+	for _, n := range nodes {
+		if n == cur {
+			inSet = true
+			break
+		}
+	}
+	if !inSet {
+		cur = nodes[0]
+		if host, port, perr := parseEndpoint(cur); perr == nil {
+			b.client.config.ServerHost = host
+			b.client.config.ServerPort = port
+			b.currentNode = cur
+		}
+	}
+	b.fixedSet = set
+	b.candidates = StableFallbackOrder(deviceUUID, set, b.currentNode)
+	b.updatedAt = time.Now()
 }

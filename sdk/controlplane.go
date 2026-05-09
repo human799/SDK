@@ -83,47 +83,7 @@ func fetchFastest(ctx context.Context, urls []string, cache *sdkCacheFile) ([]by
 	client := &http.Client{Timeout: 8 * time.Second}
 	for _, u := range urls {
 		url := u
-		go func() {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-			if err != nil {
-				ch <- fetchResult{url: url, err: err}
-				return
-			}
-			if cache != nil && cache.Entries != nil {
-				if ce, ok := cache.Entries[url]; ok {
-					if ce.ETag != "" {
-						req.Header.Set("If-None-Match", ce.ETag)
-					}
-					if ce.LastModified != "" {
-						req.Header.Set("If-Modified-Since", ce.LastModified)
-					}
-				}
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				ch <- fetchResult{url: url, err: err}
-				return
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusNotModified {
-				if payload, ok := cache.getPayload(url); ok {
-					ch <- fetchResult{url: url, payload: payload}
-					return
-				}
-				ch <- fetchResult{url: url, err: fmt.Errorf("304 but no cache payload")}
-				return
-			}
-			if resp.StatusCode != http.StatusOK {
-				ch <- fetchResult{url: url, err: fmt.Errorf("status=%d", resp.StatusCode)}
-				return
-			}
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
-			if err != nil {
-				ch <- fetchResult{url: url, err: err}
-				return
-			}
-			ch <- fetchResult{url: url, payload: body, etag: resp.Header.Get("ETag"), lm: resp.Header.Get("Last-Modified")}
-		}()
+		go func() { ch <- fetchByHeadThenGet(ctx, client, url, cache) }()
 	}
 	var firstErr error
 	for i := 0; i < len(urls); i++ {
@@ -137,6 +97,85 @@ func fetchFastest(ctx context.Context, urls []string, cache *sdkCacheFile) ([]by
 		}
 	}
 	return nil, "", "", "", firstErr
+}
+
+func fetchByHeadThenGet(ctx context.Context, client *http.Client, url string, cache *sdkCacheFile) fetchResult {
+	headReq, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return fetchResult{url: url, err: err}
+	}
+	if cache != nil && cache.Entries != nil {
+		if ce, ok := cache.Entries[url]; ok {
+			if ce.ETag != "" {
+				headReq.Header.Set("If-None-Match", ce.ETag)
+			}
+			if ce.LastModified != "" {
+				headReq.Header.Set("If-Modified-Since", ce.LastModified)
+			}
+		}
+	}
+
+	headResp, err := client.Do(headReq)
+	if err != nil {
+		return fetchResult{url: url, err: err}
+	}
+	defer headResp.Body.Close()
+
+	switch headResp.StatusCode {
+	case http.StatusNotModified:
+		if payload, ok := cache.getPayload(url); ok {
+			return fetchResult{url: url, payload: payload}
+		}
+		return fetchResult{url: url, err: fmt.Errorf("head 304 but no cache payload")}
+	case http.StatusOK:
+		// updated (or first-time), fetch full content by GET
+	case http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		// Some object storage endpoints may not support HEAD well.
+		// Fallback to GET with conditional headers.
+	default:
+		return fetchResult{url: url, err: fmt.Errorf("head status=%d", headResp.StatusCode)}
+	}
+
+	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fetchResult{url: url, err: err}
+	}
+	if cache != nil && cache.Entries != nil {
+		if ce, ok := cache.Entries[url]; ok {
+			if ce.ETag != "" {
+				getReq.Header.Set("If-None-Match", ce.ETag)
+			}
+			if ce.LastModified != "" {
+				getReq.Header.Set("If-Modified-Since", ce.LastModified)
+			}
+		}
+	}
+
+	getResp, err := client.Do(getReq)
+	if err != nil {
+		return fetchResult{url: url, err: err}
+	}
+	defer getResp.Body.Close()
+
+	if getResp.StatusCode == http.StatusNotModified {
+		if payload, ok := cache.getPayload(url); ok {
+			return fetchResult{url: url, payload: payload}
+		}
+		return fetchResult{url: url, err: fmt.Errorf("get 304 but no cache payload")}
+	}
+	if getResp.StatusCode != http.StatusOK {
+		return fetchResult{url: url, err: fmt.Errorf("get status=%d", getResp.StatusCode)}
+	}
+	body, err := io.ReadAll(io.LimitReader(getResp.Body, 2*1024*1024))
+	if err != nil {
+		return fetchResult{url: url, err: err}
+	}
+	return fetchResult{
+		url:     url,
+		payload: body,
+		etag:    getResp.Header.Get("ETag"),
+		lm:      getResp.Header.Get("Last-Modified"),
+	}
 }
 
 func decryptNodeData(raw []byte, aesKey string) ([]byte, error) {
