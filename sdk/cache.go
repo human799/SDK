@@ -32,6 +32,7 @@ func loadSDKCache(path string) (*sdkCacheFile, error) {
 	}
 	var c sdkCacheFile
 	if err := json.Unmarshal(raw, &c); err != nil {
+		sdkDebugf("loadSDKCache parse failed path=%s err=%v", path, err)
 		return nil, fmt.Errorf("parse sdk cache json: %w", err)
 	}
 	if c.Entries == nil {
@@ -49,9 +50,14 @@ func saveSDKCache(path string, c *sdkCacheFile) error {
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		sdkDebugf("saveSDKCache write tmp failed path=%s err=%v", path, err)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		sdkDebugf("saveSDKCache rename failed path=%s err=%v", path, err)
+		return err
+	}
+	return nil
 }
 func (c *sdkCacheFile) getPayload(url string) ([]byte, bool) {
 	if c == nil || c.Entries == nil {

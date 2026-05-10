@@ -76,12 +76,15 @@ func getEmbeddedPrivateKeyPEM() string {
 
 func DecodeSecretPayload(secret string) (*SecretPayload, error) {
 	if p, ok := tryParsePlainSecretPayload(secret); ok {
+		sdkDebugf("secret: decoded as plaintext JSON")
 		return p, nil
 	}
 	privateKeyPEM := getEmbeddedPrivateKeyPEM()
 	if privateKeyPEM == "" {
+		sdkDebugf("secret: no embedded key, plaintext parse failed")
 		return nil, fmt.Errorf("embedded private key is empty (plaintext parse also failed)")
 	}
+	sdkDebugf("secret: attempting RSA decrypt (embedded key present)")
 	return decodeSecretPayloadWithKey(secret, privateKeyPEM)
 }
 

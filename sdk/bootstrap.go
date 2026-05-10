@@ -166,6 +166,7 @@ func (b *SDKBootstrap) LoadConfigFile(path string) error {
 	if err := LoadEmbeddedPrivateKeyFromConfigFile(path); err != nil {
 		return b.failLocked(fmt.Sprintf("load config file failed: %v", err))
 	}
+	sdkDebugf("LoadConfigFile: embedded RSA private key loaded from %s", path)
 	b.lastError = ""
 	b.updatedAt = time.Now()
 	return nil
@@ -176,6 +177,8 @@ func (b *SDKBootstrap) Init(secret string) error {
 	if err := b.applyAutoDataDirLocked(); err != nil {
 		return b.failLocked(fmt.Sprintf("sdk data dir: %v", err))
 	}
+	sdkDebugf("Init: dataDir=%s cachePath=%s uuidPath=%s explicitDataDir=%v cachePathExplicit=%v",
+		b.dataDir, b.cachePath, b.uuidPath, b.explicitDataDir, b.cachePathExplicit)
 	if secret == "" {
 		return b.failLocked("empty secret")
 	}
@@ -183,6 +186,8 @@ func (b *SDKBootstrap) Init(secret string) error {
 	if err != nil {
 		return b.failLocked(fmt.Sprintf("decode secret failed: %v", err))
 	}
+	sdkDebugf("Init: payload app_name=%s sdk_version=%s cos_appid=%s app_domain=%s",
+		payload.AppName, payload.SDKVersion, payload.COSAppID, payload.AppDomain)
 	b.secretToken, b.payload = secret, payload
 	if b.deviceUUID == "" {
 		b.loadOrCreateDeviceUUIDLocked()
@@ -206,13 +211,20 @@ func (b *SDKBootstrap) Prepare() error {
 	}
 	payloadCopy := *b.payload
 	deviceUUID := b.deviceUUID
+	cachePath := b.cachePath
 	b.mu.Unlock()
+
+	sdkDebugf("Prepare: start cachePath=%s uuidLen=%d", cachePath, len(deviceUUID))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
-	cacheData, _ := loadSDKCache(b.cachePath)
+	cacheData, cerr := loadSDKCache(cachePath)
+	if cerr != nil {
+		sdkDebugf("Prepare: loadSDKCache warning: %v", cerr)
+	}
 	groups, updatedCache, err := resolveControlPlane(ctx, &payloadCopy, cacheData)
 	if err != nil {
+		sdkDebugf("Prepare: resolveControlPlane error: %v", err)
 		// Startup fallback: if control-plane fetch fails, try app_domain directly
 		// so the app can still boot in degraded mode.
 		if payloadCopy.AppDomain != "" {
@@ -228,8 +240,10 @@ func (b *SDKBootstrap) Prepare() error {
 				b.lastFallbackReason = "prepare_control_plane_failed_use_domain"
 				b.prepared, b.lastError, b.updatedAt = true, "", time.Now()
 				b.mu.Unlock()
+				sdkDebugf("Prepare: degraded boot via app_domain host=%s port=%d", host, port)
 				return nil
 			}
+			sdkDebugf("Prepare: app_domain DNS failed: %v", derr)
 		}
 		return b.fail(fmt.Sprintf("resolve control plane failed: %v", err))
 	}
@@ -244,12 +258,15 @@ func (b *SDKBootstrap) Prepare() error {
 	if err != nil {
 		return b.fail(fmt.Sprintf("invalid primary endpoint: %v", err))
 	}
+	sdkDebugf("Prepare: primary=%s reachable_probe...", primary)
 	// Fast-path: if selected primary is unreachable, immediately try app_domain
 	// fallback so app startup is not blocked by a known bad node.
 	if !isEndpointReachable(host, port, 1500*time.Millisecond) && payloadCopy.AppDomain != "" {
+		sdkDebugf("Prepare: primary unreachable, trying app_domain for IP")
 		if dh, derr := resolveAppDomainHost(payloadCopy.AppDomain); derr == nil {
 			host = dh
 			primary = net.JoinHostPort(host, strconv.Itoa(port))
+			sdkDebugf("Prepare: using app_domain resolved host=%s for dial", host)
 		}
 	}
 
@@ -259,6 +276,7 @@ func (b *SDKBootstrap) Prepare() error {
 	b.client.config.ServerHost, b.client.config.ServerPort = host, port
 	b.prepared, b.lastError, b.updatedAt = true, "", time.Now()
 	b.mu.Unlock()
+	sdkDebugf("Prepare: ok server=%s:%d fixedNodes=%d", host, port, len(nodes))
 	return nil
 }
 
@@ -289,6 +307,7 @@ func (b *SDKBootstrap) Start() error {
 		b.mu.Unlock()
 		return b.fail("prepare must be called before start")
 	}
+	sdkDebugf("Start: begin requestedLocalPort=%d", client.config.LocalPort)
 	b.mu.Unlock()
 	if err := client.Start(); err != nil {
 		b.state.RecordResult(false)
@@ -300,9 +319,11 @@ func (b *SDKBootstrap) Start() error {
 	b.startHealthCheckLoop()
 	b.lastError, b.updatedAt = "", time.Now()
 	b.mu.Unlock()
+	sdkDebugf("Start: ok localPort=%d", client.LocalPort())
 	return nil
 }
 func (b *SDKBootstrap) Stop() {
+	sdkDebugf("Stop: stopping proxy client")
 	b.mu.Lock()
 	c := b.client
 	b.stopAutoRefreshLocked()
@@ -336,6 +357,7 @@ func (b *SDKBootstrap) IsRunning() bool {
 func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	sdkDebugf("ReportConnectResult node=%s success=%v current=%s", node, success, b.currentNode)
 	if success {
 		b.breaker.RecordSuccess(node)
 		// Record recent success node for fallback priority
@@ -355,6 +377,7 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 						b.currentNode = b.lastSuccessNode
 						b.candidates = StableFallbackOrderWithRecentSuccess(b.deviceUUID, b.fixedSet, b.currentNode, b.lastSuccessNode)
 						b.lastFallbackReason = "recent_success_fallback"
+						sdkDebugf("fallback: recent_success -> %s", b.currentNode)
 						switched = true
 					}
 				}
@@ -371,6 +394,7 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 					b.client.config.ServerHost, b.client.config.ServerPort = host, port
 					b.currentNode, b.candidates = n, StableFallbackOrder(b.deviceUUID, b.fixedSet, n)
 					b.lastFallbackReason = "fixed_set_switch"
+					sdkDebugf("fallback: fixed_set_switch -> %s", n)
 					switched = true
 					break
 				}
@@ -381,6 +405,7 @@ func (b *SDKBootstrap) ReportConnectResult(node string, success bool) {
 				b.lastNetworkCheckAt = time.Now()
 				if !b.lastNetworkOK {
 					b.lastFallbackReason = "network_unreachable"
+					sdkDebugf("network probe baidu reachable=%v", b.lastNetworkOK)
 				}
 				b.tryDomainFallbackLocked()
 			}
@@ -528,21 +553,25 @@ func (b *SDKBootstrap) applyAutoDataDirLocked() error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
+		sdkDebugf("applyAutoDataDir: explicit cache dir=%s", dir)
 		return nil
 	}
 	for _, dir := range autoSDKDataDirCandidates() {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
+			sdkDebugf("applyAutoDataDir: skip candidate %q: %v", dir, err)
 			continue
 		}
 		b.dataDir = dir
 		b.cachePath = filepath.Join(dir, "sdk_cache.json")
 		b.uuidPath = filepath.Join(dir, "sdk_device_uuid.txt")
+		sdkDebugf("applyAutoDataDir: selected dataDir=%s", dir)
 		return nil
 	}
 	// Same layout as pre–auto-datadir SDK: cwd files (always mkdir-able).
 	b.dataDir = "."
 	b.cachePath = "sdk_cache.json"
 	b.uuidPath = "sdk_device_uuid.txt"
+	sdkDebugf("applyAutoDataDir: fallback cwd dataDir=.")
 	return nil
 }
 
@@ -560,6 +589,7 @@ func (b *SDKBootstrap) SetDataDir(path string) error {
 	b.dataDir = p
 	b.cachePath = filepath.Join(p, "sdk_cache.json")
 	b.uuidPath = filepath.Join(p, "sdk_device_uuid.txt")
+	sdkDebugf("SetDataDir: %s", p)
 	b.updatedAt = time.Now()
 	return nil
 }
@@ -578,6 +608,7 @@ func (b *SDKBootstrap) SetCacheFile(path string) error {
 	}
 	b.cachePathExplicit = true
 	b.cachePath = path
+	sdkDebugf("SetCacheFile: %s", path)
 	b.updatedAt = time.Now()
 	return nil
 }
@@ -585,6 +616,7 @@ func (b *SDKBootstrap) SetCacheFile(path string) error {
 // SetNetworkSwitch marks that a network switch has occurred.
 // This triggers a protection window during which熔断升级 is suspended.
 func (b *SDKBootstrap) SetNetworkSwitch() {
+	sdkDebugf("SetNetworkSwitch: scheduling control-plane refresh")
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.networkSwitchLastAt = time.Now()
@@ -597,10 +629,12 @@ func (b *SDKBootstrap) SetNetworkSwitch() {
 func (b *SDKBootstrap) tryDomainFallbackLocked() {
 	now := time.Now()
 	if b.payload == nil || b.payload.AppDomain == "" {
+		sdkDebugf("tryDomainFallback: no app_domain -> EMERGENCY")
 		b.state.EnterEmergency()
 		return
 	}
 	if !b.nextDNSAt.IsZero() && now.Before(b.nextDNSAt) {
+		sdkDebugf("tryDomainFallback: throttled until nextDNSAt")
 		return
 	}
 	port := b.client.config.ServerPort
@@ -610,6 +644,7 @@ func (b *SDKBootstrap) tryDomainFallbackLocked() {
 	host, err := resolveAppDomainHost(b.payload.AppDomain)
 	if err != nil {
 		b.dnsPersistFailuresCount++
+		sdkDebugf("tryDomainFallback: DNS failed domain=%s err=%v failures=%d", b.payload.AppDomain, err, b.dnsPersistFailuresCount)
 		// Dual-layer DNS refresh: short period first, then long period for persistent failures
 		var nextInterval time.Duration
 		if b.dnsPersistFailuresCount <= b.dnsPersistFailures {
@@ -626,6 +661,7 @@ func (b *SDKBootstrap) tryDomainFallbackLocked() {
 	b.client.config.ServerHost, b.client.config.ServerPort = host, port
 	b.currentNode = net.JoinHostPort(host, strconv.Itoa(port))
 	b.lastFallbackReason = "app_domain_dns"
+	sdkDebugf("tryDomainFallback: ok host=%s port=%d", host, port)
 	b.nextDNSAt = now.Add(time.Duration(b.dnsRefreshShortSec) * time.Second)
 	// Immediately try to refresh control plane after domain fallback
 	// This allows faster recovery when control plane is back online
@@ -712,21 +748,25 @@ func (b *SDKBootstrap) fail(msg string) error {
 func (b *SDKBootstrap) failLocked(msg string) error {
 	b.lastError = msg
 	b.updatedAt = time.Now()
+	sdkDebugf("ERROR %s", msg)
 	return errors.New(msg)
 }
 
 func (b *SDKBootstrap) loadOrCreateDeviceUUIDLocked() {
 	if b.deviceUUID != "" {
+		sdkDebugf("deviceUUID: using in-memory value")
 		return
 	}
 	if s, err := os.ReadFile(b.uuidPath); err == nil {
 		v := strings.TrimSpace(string(s))
 		if v != "" {
 			b.deviceUUID = v
+			sdkDebugf("deviceUUID: loaded from %s", b.uuidPath)
 			return
 		}
 	}
 	b.deviceUUID = newDeviceUUID()
+	sdkDebugf("deviceUUID: generated new -> %s", b.uuidPath)
 	_ = b.persistDeviceUUIDLocked()
 }
 
@@ -797,12 +837,14 @@ func (b *SDKBootstrap) refreshControlPlaneOnce() {
 	cacheData, _ := loadSDKCache(cachePath)
 	groups, updatedCache, err := resolveControlPlane(ctx, &payloadCopy, cacheData)
 	if err != nil {
+		sdkDebugf("refreshControlPlane: resolve failed: %v", err)
 		return
 	}
 	_ = saveSDKCache(cachePath, updatedCache)
 	set := SelectFixedNodeSet(deviceUUID, groups)
 	nodes := set.AsList()
 	if len(nodes) == 0 {
+		sdkDebugf("refreshControlPlane: empty node set after resolve")
 		return
 	}
 
@@ -835,6 +877,7 @@ func (b *SDKBootstrap) refreshControlPlaneOnce() {
 
 	// Active switch: check if there's a better node
 	b.checkAndSwitchToBetterNode()
+	sdkDebugf("refreshControlPlane: ok nodes=%d current=%s", len(nodes), b.currentNode)
 }
 
 // checkHighAvailabilityNodes periodically probes high availability nodes (nodesE).

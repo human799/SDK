@@ -33,19 +33,29 @@ type fetchResult struct {
 
 func resolveControlPlane(ctx context.Context, p *SecretPayload, cache *sdkCacheFile) (NodeGroups, *sdkCacheFile, error) {
 	urls := buildNodeDataURLs(p)
+	sdkDebugf("controlPlane: beijingDate=%s urls=%d", beijingNow().Format("20060102"), len(urls))
+	for i, u := range urls {
+		sdkDebugf("  url[%d]=%s", i, u)
+	}
 	raw, used, etag, lm, err := fetchFastest(ctx, urls, cache)
 	if err != nil {
+		sdkDebugf("controlPlane: fetch failed: %v", err)
 		return NodeGroups{}, cache, err
 	}
+	sdkDebugf("controlPlane: fetch ok used=%s etag=%q", used, etag)
 	plain, err := decryptNodeData(raw, p.AESKey)
 	if err != nil {
+		sdkDebugf("controlPlane: decrypt failed: %v", err)
 		return NodeGroups{}, cache, err
 	}
 	var nodes remoteNodePayload
 	if err := json.Unmarshal(plain, &nodes); err != nil {
+		sdkDebugf("controlPlane: json parse failed: %v", err)
 		return NodeGroups{}, cache, fmt.Errorf("parse node json: %w", err)
 	}
 	groups := sanitizeNodeGroups(NodeGroups{A: nodes.NodesA, B: nodes.NodesB, C: nodes.NodesC, D: nodes.NodesD, E: nodes.NodesE})
+	sdkDebugf("controlPlane: groups sizes A=%d B=%d C=%d D=%d E=%d",
+		len(groups.A), len(groups.B), len(groups.C), len(groups.D), len(groups.E))
 	if cache == nil {
 		cache = &sdkCacheFile{Entries: map[string]cacheEntry{}}
 	}
@@ -91,6 +101,9 @@ func fetchFastest(ctx context.Context, urls []string, cache *sdkCacheFile) ([]by
 		if r.err == nil && len(r.payload) > 0 {
 			cancel()
 			return r.payload, r.url, r.etag, r.lm, nil
+		}
+		if r.err != nil {
+			sdkDebugf("fetchFastest: fail url=%s err=%v", r.url, r.err)
 		}
 		if firstErr == nil {
 			firstErr = fmt.Errorf("%s: %w", r.url, r.err)

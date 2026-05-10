@@ -4,7 +4,6 @@ package sdk
 import (
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -114,7 +113,7 @@ func (c *ProxyClient) Start() error {
 		c.pool = newConnPool(c.config)
 	}
 
-	log.Printf("[SDK] started, local %s -> server %s:%d (TLS=%v)",
+	sdkDebugf("proxy started local=%s server=%s:%d TLS=%v",
 		ln.Addr(), maskIP(c.config.ServerHost), c.config.ServerPort, c.config.TLSEnabled)
 
 	go c.acceptLoop()
@@ -162,7 +161,7 @@ func (c *ProxyClient) acceptLoop() {
 			case <-c.done:
 				return
 			default:
-				log.Printf("[SDK] accept error: %v", err)
+				sdkDebugf("proxy accept error: %v", err)
 				continue
 			}
 		}
@@ -176,7 +175,7 @@ func (c *ProxyClient) handleConn(local net.Conn) {
 	if c.config.TLSEnabled {
 		pc := c.pool.get()
 		if pc == nil {
-			log.Printf("[SDK] pool: no connection available")
+			sdkDebugf("proxy pool: no connection available")
 			c.reportConnectResult(false)
 			return
 		}
@@ -197,7 +196,7 @@ func (c *ProxyClient) handleConn(local net.Conn) {
 	timeout := time.Duration(c.config.DialTimeout) * time.Second
 	remote, err := net.DialTimeout("tcp", serverAddr, timeout)
 	if err != nil {
-		log.Printf("[SDK] connect to server failed %s: %v", maskIP(serverAddr), err)
+		sdkDebugf("proxy plain TCP dial failed %s: %v", maskIP(serverAddr), err)
 		c.reportConnectResult(false)
 		return
 	}

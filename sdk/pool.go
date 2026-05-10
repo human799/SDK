@@ -2,7 +2,6 @@ package sdk
 
 import (
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"strings"
@@ -164,7 +163,7 @@ func (p *connPool) dial() *poolConn {
 
 	rawConn, err := (&net.Dialer{Timeout: timeout}).Dial("tcp", serverAddr)
 	if err != nil {
-		log.Printf("[Pool] TCP dial failed %s: %v", maskIP(serverAddr), err)
+		sdkDebugf("pool TCP dial failed %s: %v", maskIP(serverAddr), err)
 		return nil
 	}
 
@@ -176,12 +175,12 @@ func (p *connPool) dial() *poolConn {
 	tlsConn.SetDeadline(time.Now().Add(timeout))
 	if err := tlsConn.Handshake(); err != nil {
 		rawConn.Close()
-		log.Printf("[Pool] uTLS handshake failed (SNI=%s hello=%s): %v", sni, helloID.Client, err)
+		sdkDebugf("pool uTLS handshake failed SNI=%s hello=%s: %v", sni, helloID.Client, err)
 		return nil
 	}
 	tlsConn.SetDeadline(time.Time{})
 
-	log.Printf("[Pool] new conn SNI=%s hello=%s -> %s", sni, helloID.Client, maskIP(serverAddr))
+	sdkDebugf("pool new conn SNI=%s hello=%s -> %s", sni, helloID.Client, maskIP(serverAddr))
 
 	p.mu.Lock()
 	p.total++
